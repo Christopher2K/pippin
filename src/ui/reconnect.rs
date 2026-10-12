@@ -59,9 +59,17 @@ impl Reconnector {
         self.reconnecting
     }
 
+    /// The session finished its handshake. That alone doesn't prove the
+    /// host is healthy (it may accept and then send nothing), so the
+    /// backoff keeps growing until [`Self::video`].
     pub fn connected(&mut self) {
         self.connected_once = true;
         self.reconnecting = false;
+    }
+
+    /// A picture arrived: the session really works, so the next drop
+    /// starts again from the first delay.
+    pub fn video(&mut self) {
         self.backoff.reset();
     }
 
@@ -110,7 +118,24 @@ mod tests {
         assert_eq!(r.ended(true), secs(2));
         assert_eq!(r.ended(true), secs(4));
         r.connected();
+        r.video();
         assert!(!r.reconnecting());
+        assert_eq!(r.ended(true), secs(1));
+    }
+
+    #[test]
+    fn backoff_resets_only_after_video() {
+        let mut r = Reconnector::new(true);
+        r.connected();
+        r.video();
+        assert_eq!(r.ended(true), secs(1));
+        // Handshakes that succeed but never deliver video keep backing off.
+        r.connected();
+        assert_eq!(r.ended(true), secs(2));
+        r.connected();
+        assert_eq!(r.ended(true), secs(4));
+        r.connected();
+        r.video();
         assert_eq!(r.ended(true), secs(1));
     }
 

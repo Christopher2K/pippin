@@ -301,6 +301,7 @@ impl ApplicationHandler<Tagged> for App {
                 }
             }
             Event::Frame => {
+                self.reconnector.video();
                 if let Some(w) = &self.window {
                     w.request_redraw();
                 }
