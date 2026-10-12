@@ -38,8 +38,9 @@ impl std::fmt::Debug for Fields {
 }
 
 impl Fields {
-    fn complete(&self) -> bool {
-        !self.host.trim().is_empty() && !self.user.trim().is_empty() && !self.password.is_empty()
+    /// Ready to connect; an empty password is fine when one is saved.
+    fn complete(&self, saved: bool) -> bool {
+        !self.host.trim().is_empty() && !self.user.trim().is_empty() && (saved || !self.password.is_empty())
     }
 }
 
@@ -76,9 +77,19 @@ struct Dialog {
     result: Option<Fields>,
     failure: Option<anyhow::Error>,
     repaint_at: Option<Instant>,
+    /// Asks whether a password is saved for (host, user).
+    has_saved: Box<dyn Fn(&str, &str) -> bool>,
+    /// Answer for the host and user as of the last lookup. Refreshed when
+    /// those fields lose focus, not per frame, since it's a D-Bus call.
+    saved: bool,
 }
 
 impl Dialog {
+    fn refresh_saved(&mut self) {
+        let (h, u) = (self.fields.host.trim(), self.fields.user.trim());
+        self.saved = !h.is_empty() && !u.is_empty() && (self.has_saved)(h, u);
+    }
+
     fn create(&mut self, el: &ActiveEventLoop) -> Result<Gpu> {
         let attrs = Window::default_attributes()
             .with_title("Connect — macshare")
@@ -146,6 +157,7 @@ impl Dialog {
             let focus_first = !self.focused;
             let f = &mut self.fields;
             let mut first_empty = None;
+            let mut target_changed = false;
             egui::Grid::new("fields").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
                 for (label, value, secret) in
                     [("Host", &mut f.host, false), ("User", &mut f.user, false), ("Password", &mut f.password, true)]
@@ -156,6 +168,7 @@ impl Dialog {
                     if empty && first_empty.is_none() {
                         first_empty = Some(r.id);
                     }
+                    target_changed |= !secret && r.lost_focus();
                     ui.end_row();
                 }
             });
@@ -166,13 +179,16 @@ impl Dialog {
                 self.focused = true;
             }
             ui.add_space(4.0);
+            if self.saved && f.password.is_empty() {
+                ui.weak("Saved password will be used");
+            }
             ui.checkbox(&mut f.save, "Save password in keyring");
             if let Some(e) = &self.error {
                 ui.add_space(4.0);
                 ui.colored_label(ui.visuals().error_fg_color, e);
             }
             ui.add_space(8.0);
-            let ready = f.complete();
+            let ready = f.complete(self.saved);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                 if ui.add_enabled(ready, egui::Button::new("Connect")).clicked() || (enter && ready) {
                     action = Some(true);
@@ -181,6 +197,9 @@ impl Dialog {
                     action = Some(false);
                 }
             });
+            if target_changed {
+                self.refresh_saved();
+            }
         });
         action
     }
@@ -310,7 +329,14 @@ impl ApplicationHandler<Tagged> for Dialog {
 /// Shows the dialog until Connect (returns the fields) or Cancel / close
 /// (returns `None`). `error` is shown under the fields, e.g. after the host
 /// rejected the previous attempt.
-pub fn run(el: &mut EventLoop<Tagged>, fields: Fields, error: Option<String>) -> Result<Option<Fields>> {
+/// `has_saved` tells whether a password is stored for a host and user; an
+/// empty password field may then be submitted.
+pub fn run(
+    el: &mut EventLoop<Tagged>,
+    fields: Fields,
+    error: Option<String>,
+    has_saved: impl Fn(&str, &str) -> bool + 'static,
+) -> Result<Option<Fields>> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle_from_env(Box::new(
         el.owned_display_handle(),
     )));
@@ -324,7 +350,10 @@ pub fn run(el: &mut EventLoop<Tagged>, fields: Fields, error: Option<String>) ->
         result: None,
         failure: None,
         repaint_at: None,
+        has_saved: Box::new(has_saved),
+        saved: false,
     };
+    app.refresh_saved();
     el.run_app_on_demand(&mut app)?;
     if let Some(e) = app.failure {
         return Err(e);

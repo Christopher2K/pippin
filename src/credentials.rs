@@ -121,6 +121,15 @@ pub fn lookup(
     Ok(None)
 }
 
+/// The password for a dialog submission: what was typed, or with the field
+/// left empty, the stored one (`stored` is only asked then).
+pub fn dialog_password(typed: String, stored: impl FnOnce() -> Option<String>) -> Option<(String, Source)> {
+    if !typed.is_empty() {
+        return Some((typed, Source::Dialog));
+    }
+    stored().map(|p| (p, Source::Keyring))
+}
+
 /// Picks the password: explicit, then stdin, then keyring, then the prompt.
 #[cfg(test)]
 pub fn resolve(
@@ -333,6 +342,14 @@ mod tests {
         assert!(m.get(ACC).unwrap().is_none());
         after_auth(&m, ACC, "ticked", Source::Dialog, true, true, no_confirm);
         assert_eq!(m.get(ACC).unwrap().as_deref(), Some("ticked"));
+    }
+
+    #[test]
+    fn empty_dialog_password_uses_keyring() {
+        let none = || -> Option<String> { panic!("looked up") };
+        assert_eq!(dialog_password("typed".into(), none), Some(("typed".into(), Source::Dialog)));
+        assert_eq!(dialog_password(String::new(), || Some("kr".into())), Some(("kr".into(), Source::Keyring)));
+        assert_eq!(dialog_password(String::new(), || None), None);
     }
 
     #[test]

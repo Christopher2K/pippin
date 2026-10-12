@@ -192,7 +192,7 @@ fn run() -> Result<()> {
         (credentials::Mode::Dialog, ..) => return dialog_loop(&mut event_loop, &cli, &store),
         _ => bail!("the host and --user are required (or use --dialog)"),
     };
-    connect(&mut event_loop, &cli, &store, &host, &user, password, source, cli.save_password, tty).map(drop)
+    connect(&mut event_loop, &cli, &store, &host, &user, password, source, cli.save_password, tty, false).map(drop)
 }
 
 /// Shows the connect dialog until a session runs or the user cancels; any
@@ -209,12 +209,29 @@ fn dialog_loop(
         save: cli.save_password,
     };
     let mut error = None;
+    let port = cli.port;
+    let stored = |host: &str, user: &str| match store.get(&credentials::account(user, host, port)) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("keyring unavailable: {e:#}");
+            None
+        }
+    };
     loop {
-        let Some(f) = ui::dialog::run(event_loop, fields.clone(), error.take())? else {
+        let has_saved = {
+            let store = store.clone();
+            move |host: &str, user: &str| matches!(store.get(&credentials::account(user, host, port)), Ok(Some(_)))
+        };
+        let Some(f) = ui::dialog::run(event_loop, fields.clone(), error.take(), has_saved)? else {
             return Ok(());
         };
-        let source = credentials::Source::Dialog;
-        match connect(event_loop, cli, store, &f.host, &f.user, f.password.clone(), source, f.save, false)? {
+        let Some((password, source)) = credentials::dialog_password(f.password.clone(), || stored(&f.host, &f.user))
+        else {
+            error = Some(format!("No saved password for {}@{}; enter one.", f.user, f.host));
+            fields = f;
+            continue;
+        };
+        match connect(event_loop, cli, store, &f.host, &f.user, password, source, f.save, false, true)? {
             Outcome::Done => return Ok(()),
             Outcome::Retry { msg, wrong_password } => {
                 error = Some(msg);
@@ -245,8 +262,8 @@ fn connect(
     source: credentials::Source,
     save: bool,
     interactive: bool,
+    from_dialog: bool,
 ) -> Result<Outcome> {
-    let from_dialog = source == credentials::Source::Dialog;
     let host = match resolve_ipv4(host_name, cli.port) {
         Ok(h) => h,
         Err(e) if from_dialog => return Ok(Outcome::Retry { msg: format!("{e:#}"), wrong_password: false }),
