@@ -18,6 +18,33 @@ pub enum Source {
     Stdin,
     Keyring,
     Prompt,
+    /// Typed into the connect dialog; its checkbox is the save decision.
+    Dialog,
+}
+
+/// How to get the missing connection details.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// Host, user and password are all known.
+    Direct,
+    /// Ask for the password on the terminal.
+    Terminal,
+    /// Show the connect dialog.
+    Dialog,
+    /// Something is missing and there is no way to ask.
+    Missing,
+}
+
+/// Picks how to proceed. The dialog is for launches without a terminal
+/// (e.g. from a .desktop file) or when asked for with `--dialog`.
+pub fn choose(force_dialog: bool, have_target: bool, have_password: bool, tty: bool) -> Mode {
+    match () {
+        _ if force_dialog => Mode::Dialog,
+        _ if have_target && have_password => Mode::Direct,
+        _ if !tty => Mode::Dialog,
+        _ if have_target => Mode::Terminal,
+        _ => Mode::Missing,
+    }
 }
 
 /// A password store keyed by account, `user@host:port`.
@@ -73,7 +100,29 @@ pub fn read_line(input: &mut dyn BufRead) -> Result<String> {
     Ok(trimmed.strip_suffix('\r').unwrap_or(trimmed).to_owned())
 }
 
+/// Looks for a password without asking: explicit, then stdin, then keyring.
+pub fn lookup(
+    explicit: Option<String>,
+    stdin: Option<&mut dyn BufRead>,
+    store: &dyn Store,
+    account: &str,
+) -> Result<Option<(String, Source)>> {
+    if let Some(p) = explicit {
+        return Ok(Some((p, Source::Explicit)));
+    }
+    if let Some(input) = stdin {
+        return Ok(Some((read_line(input)?, Source::Stdin)));
+    }
+    match store.get(account) {
+        Ok(Some(p)) => return Ok(Some((p, Source::Keyring))),
+        Ok(None) => {}
+        Err(e) => tracing::warn!("keyring unavailable: {e:#}"),
+    }
+    Ok(None)
+}
+
 /// Picks the password: explicit, then stdin, then keyring, then the prompt.
+#[cfg(test)]
 pub fn resolve(
     explicit: Option<String>,
     stdin: Option<&mut dyn BufRead>,
@@ -81,27 +130,21 @@ pub fn resolve(
     account: &str,
     prompt: impl FnOnce() -> Result<String>,
 ) -> Result<(String, Source)> {
-    if let Some(p) = explicit {
-        return Ok((p, Source::Explicit));
+    match lookup(explicit, stdin, store, account)? {
+        Some(found) => Ok(found),
+        None => Ok((prompt()?, Source::Prompt)),
     }
-    if let Some(input) = stdin {
-        return Ok((read_line(input)?, Source::Stdin));
-    }
-    match store.get(account) {
-        Ok(Some(p)) => return Ok((p, Source::Keyring)),
-        Ok(None) => {}
-        Err(e) => tracing::warn!("keyring unavailable: {e:#}"),
-    }
-    Ok((prompt()?, Source::Prompt))
 }
 
-/// Saving is opt-in: always with `save` (`--save-password`), otherwise only
-/// a prompted password the user agrees to keep.
+/// Saving is opt-in: always with `save` (`--save-password`, or the dialog's
+/// checkbox), otherwise only a terminal-prompted password the user agrees to
+/// keep. A dialog password is never asked about on the terminal.
 pub fn should_save(source: Source, save: bool, interactive: bool) -> bool {
     match source {
         Source::Keyring => false,
         _ if save => true,
         Source::Prompt => interactive,
+        Source::Dialog => false,
         _ => false,
     }
 }
@@ -262,6 +305,34 @@ mod tests {
             let mut input = answer;
             assert_eq!(confirm_save(&mut input), want);
         }
+    }
+
+    #[test]
+    fn when_to_show_the_dialog() {
+        // (force, target, password, tty)
+        assert_eq!(choose(true, true, true, true), Mode::Dialog);
+        assert_eq!(choose(false, true, true, false), Mode::Direct, "keyring hit skips the dialog");
+        assert_eq!(choose(false, true, false, false), Mode::Dialog);
+        assert_eq!(choose(false, false, false, false), Mode::Dialog);
+        assert_eq!(choose(false, true, false, true), Mode::Terminal);
+        assert_eq!(choose(false, false, false, true), Mode::Missing);
+    }
+
+    #[test]
+    fn lookup_does_not_prompt() {
+        assert_eq!(lookup(None, None, &Mem::default(), ACC).unwrap(), None);
+        assert_eq!(lookup(None, None, &stored("kr"), ACC).unwrap(), Some(("kr".into(), Source::Keyring)));
+    }
+
+    #[test]
+    fn dialog_checkbox_decides_and_never_asks() {
+        let m = Mem::default();
+        assert!(!should_save(Source::Dialog, false, true));
+        after_auth(&m, ACC, "unticked", Source::Dialog, true, false, no_confirm);
+        after_auth(&m, ACC, "wrong", Source::Dialog, false, true, no_confirm);
+        assert!(m.get(ACC).unwrap().is_none());
+        after_auth(&m, ACC, "ticked", Source::Dialog, true, true, no_confirm);
+        assert_eq!(m.get(ACC).unwrap().as_deref(), Some("ticked"));
     }
 
     #[test]

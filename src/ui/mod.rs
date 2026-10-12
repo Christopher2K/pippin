@@ -1,6 +1,7 @@
 //! The viewer window: renders the remote canvas, forwards input and keeps
 //! the host's virtual display sized to the window.
 
+pub mod dialog;
 mod keymap;
 mod render;
 
@@ -15,6 +16,7 @@ use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, Window
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
+use winit::platform::run_on_demand::EventLoopExtRunOnDemand;
 use winit::window::{CursorIcon, CustomCursor, Window, WindowId};
 
 use crate::proto::messages::{BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN_SCROLL_DOWN, BTN_SCROLL_UP, DisplayRequest};
@@ -335,9 +337,14 @@ impl ApplicationHandler<Event> for App {
     }
 }
 
+/// The one event loop shared by the connect dialog and the viewer; winit
+/// allows only one per process, so each runs on it in turn.
+pub fn event_loop() -> Result<EventLoop<Event>> {
+    Ok(EventLoop::<Event>::with_user_event().build()?)
+}
+
 /// Runs the viewer until the window closes or the session ends.
-pub fn run(cfg: Config, opts: Options) -> Result<()> {
-    let event_loop = EventLoop::<Event>::with_user_event().build()?;
+pub fn run(event_loop: &mut EventLoop<Event>, cfg: Config, opts: Options) -> Result<()> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle_from_env(Box::new(
         event_loop.owned_display_handle(),
     )));
@@ -359,7 +366,7 @@ pub fn run(cfg: Config, opts: Options) -> Result<()> {
         pressed: HashMap::new(),
         cursors: HashMap::new(),
     };
-    event_loop.run_app(&mut app)?;
+    event_loop.run_app_on_demand(&mut app)?;
     if let Some(s) = app.session.take() {
         s.shutdown();
     }
