@@ -12,18 +12,71 @@ use anyhow::{Result, bail};
 
 use super::ffi::{self, AVPixelFormat as PixFmt};
 
-/// A decoded picture with tightly packed planes (stride == width).
+/// One image plane: `rows` rows of `stride` bytes, of which the first
+/// `width` are pixels. The last row may be only `width` bytes long.
+#[derive(Clone, Copy)]
+pub struct PlaneRef<'a> {
+    pub data: &'a [u8],
+    pub stride: u32,
+}
+
+/// Owns a reference to a decoder frame so its planes can be read without
+/// copying. libavcodec recycles the buffer once the last reference drops.
+struct FrameRef(*mut ffi::AVFrame);
+
+// The frame is refcounted and never written once decoded.
+unsafe impl Send for FrameRef {}
+
+impl Drop for FrameRef {
+    fn drop(&mut self) {
+        unsafe { ffi::av_frame_free(&mut self.0) };
+    }
+}
+
+enum Planes {
+    /// Planar Y/U/V straight from the decoder's buffers.
+    Frame(FrameRef),
+    /// Tightly packed planes, for formats that need conversion.
+    Owned([Vec<u8>; 3]),
+}
+
+/// A decoded picture.
 pub struct Picture {
     pub pts: i64,
     pub width: u32,
     pub height: u32,
     pub chroma_width: u32,
     pub chroma_height: u32,
-    pub y: Vec<u8>,
-    pub u: Vec<u8>,
-    pub v: Vec<u8>,
+    planes: Planes,
     /// The decoder flagged concealment or a reference error in this frame.
     pub damaged: bool,
+}
+
+impl Picture {
+    /// Plane 0 is Y, 1 is U (Cb), 2 is V (Cr).
+    pub fn plane(&self, i: usize) -> PlaneRef<'_> {
+        let (w, h) = if i == 0 { (self.width, self.height) } else { (self.chroma_width, self.chroma_height) };
+        match &self.planes {
+            Planes::Owned(p) => PlaneRef { data: &p[i], stride: w },
+            Planes::Frame(f) => unsafe {
+                let stride = (*f.0).linesize[i] as u32;
+                let len = if h == 0 { 0 } else { (h - 1) as usize * stride as usize + w as usize };
+                PlaneRef { data: std::slice::from_raw_parts((*f.0).data[i], len), stride }
+            },
+        }
+    }
+}
+
+/// How to open the decoder.
+#[derive(Debug, Clone, Copy)]
+pub struct DecoderOptions {
+    /// Try CUDA before falling back to software.
+    pub prefer_hw: bool,
+    /// Software decoding threads. Apple's stream enables wavefront parallel
+    /// processing with entry points, so slice threading splits each picture
+    /// by CTU row without delaying output. Past ~5 threads the 16-row tiles
+    /// stop scaling and synchronisation costs win.
+    pub threads: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,21 +129,21 @@ pub fn set_log_level(verbose: bool) {
 }
 
 impl Decoder {
-    pub fn new(prefer_hw: bool) -> Result<Self> {
-        if prefer_hw {
-            match Self::open(true) {
+    pub fn new(opts: DecoderOptions) -> Result<Self> {
+        if opts.prefer_hw {
+            match Self::open(true, opts.threads) {
                 Ok(d) => return Ok(d),
                 Err(e) => tracing::warn!("hardware decoding unavailable ({e}); using software"),
             }
         }
-        Self::open(false)
+        Self::open(false, opts.threads)
     }
 
     pub fn backend(&self) -> Backend {
         self.backend
     }
 
-    fn open(hw: bool) -> Result<Self> {
+    fn open(hw: bool, threads: u32) -> Result<Self> {
         unsafe {
             let codec = ffi::avcodec_find_decoder(ffi::AVCodecID::AV_CODEC_ID_HEVC);
             if codec.is_null() {
@@ -128,8 +181,11 @@ impl Decoder {
                 (*ctx).hw_device_ctx = dev;
                 (*ctx).get_format = Some(pick_format);
             } else {
+                // Not 0 (auto): that picks one thread per core plus one, and
+                // on Apple Silicon the extra efficiency-core threads make
+                // decoding nearly twice as slow as 4.
                 (*ctx).thread_type = ffi::FF_THREAD_SLICE as i32;
-                (*ctx).thread_count = 0;
+                (*ctx).thread_count = threads.max(1) as i32;
             }
             let r = ffi::avcodec_open2(ctx, codec, ptr::null_mut());
             if r < 0 {
@@ -200,13 +256,14 @@ impl Decoder {
                 }
                 v
             };
-            let (y, u, v, cw, ch) = match fmt {
-                x if x == PixFmt::AV_PIX_FMT_YUV444P || x == PixFmt::AV_PIX_FMT_YUVJ444P => {
-                    (plane(0, w, h), plane(1, w, h), plane(2, w, h), w, h)
-                }
+            let planar = |cw: usize, ch: usize| -> Option<(Planes, usize, usize)> {
+                let r = ffi::av_frame_clone(f);
+                (!r.is_null()).then(|| (Planes::Frame(FrameRef(r)), cw, ch))
+            };
+            let (planes, cw, ch) = match fmt {
+                x if x == PixFmt::AV_PIX_FMT_YUV444P || x == PixFmt::AV_PIX_FMT_YUVJ444P => planar(w, h)?,
                 x if x == PixFmt::AV_PIX_FMT_YUV420P || x == PixFmt::AV_PIX_FMT_YUVJ420P => {
-                    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
-                    (plane(0, w, h), plane(1, cw, ch), plane(2, cw, ch), cw, ch)
+                    planar(w.div_ceil(2), h.div_ceil(2))?
                 }
                 x if x == PixFmt::AV_PIX_FMT_NV12 || x == PixFmt::AV_PIX_FMT_NV24 => {
                     let (cw, ch) = if x == PixFmt::AV_PIX_FMT_NV12 {
@@ -216,7 +273,7 @@ impl Decoder {
                     };
                     let uv = plane(1, cw * 2, ch);
                     let (u, v) = uv.as_chunks::<2>().0.iter().map(|p| (p[0], p[1])).unzip();
-                    (plane(0, w, h), u, v, cw, ch)
+                    (Planes::Owned([plane(0, w, h), u, v]), cw, ch)
                 }
                 other => {
                     if !self.warned_format {
@@ -235,9 +292,7 @@ impl Decoder {
                 height: h as u32,
                 chroma_width: cw as u32,
                 chroma_height: ch as u32,
-                y,
-                u,
-                v,
+                planes,
                 damaged,
             })
         }
@@ -298,14 +353,18 @@ mod tests {
         aus
     }
 
-    fn decode_file(path: &str, hw: bool) -> (Backend, Vec<(u32, u32, u32, u32)>) {
+    fn decode_file(path: &str, hw: bool, threads: u32) -> (Backend, Vec<(u32, u32, u32, u32)>) {
         let data = std::fs::read(path).unwrap();
-        let mut d = Decoder::new(hw).unwrap();
+        let mut d = Decoder::new(DecoderOptions { prefer_hw: hw, threads }).unwrap();
         let mut got = Vec::new();
         for (i, au) in access_units(&data).iter().enumerate() {
             d.decode(au, i as i64, &mut |p: Picture| {
-                assert_eq!(p.y.len(), (p.width * p.height) as usize);
-                assert_eq!(p.u.len(), (p.chroma_width * p.chroma_height) as usize);
+                for i in 0..3 {
+                    let (w, h) = if i == 0 { (p.width, p.height) } else { (p.chroma_width, p.chroma_height) };
+                    let pl = p.plane(i);
+                    assert!(pl.stride >= w);
+                    assert_eq!(pl.data.len(), ((h - 1) * pl.stride + w) as usize);
+                }
                 got.push((p.width, p.height, p.chroma_width, p.chroma_height));
             });
         }
@@ -318,14 +377,34 @@ mod tests {
     #[ignore]
     fn decodes_sample_streams() {
         let dir = std::env::var("MACSHARE_TEST_HEVC_DIR").expect("MACSHARE_TEST_HEVC_DIR");
-        for hw in [false, true] {
+        for (hw, threads) in [(false, 1), (false, 4), (true, 1)] {
             for (file, chroma) in [("t444.hevc", (1280, 720)), ("t420.hevc", (640, 360))] {
-                let (backend, pics) = decode_file(&format!("{dir}/{file}"), hw);
-                eprintln!("{file} hw={hw}: {backend:?}, {} pictures", pics.len());
-                // Low-delay decoding may hold back the last few pictures.
+                let (backend, pics) = decode_file(&format!("{dir}/{file}"), hw, threads);
+                eprintln!("{file} hw={hw} threads={threads}: {backend:?}, {} pictures", pics.len());
+                // The decoder may hold back the last few pictures.
                 assert!(pics.len() >= 25, "{file}: only {} pictures", pics.len());
                 assert!(pics.iter().all(|&p| p == (1280, 720, chroma.0, chroma.1)));
             }
+        }
+    }
+
+    /// Times software decoding of a captured stream (MACSHARE_DUMP_HEVC)
+    /// at several thread counts:
+    /// MACSHARE_BENCH_HEVC=stream.hevc cargo test --release bench -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_threads() {
+        let path = std::env::var("MACSHARE_BENCH_HEVC").expect("MACSHARE_BENCH_HEVC");
+        let aus = access_units(&std::fs::read(path).unwrap());
+        for threads in [1, 2, 3, 4, 5, 6, 8] {
+            let mut d = Decoder::new(DecoderOptions { prefer_hw: false, threads }).unwrap();
+            let mut pics = 0;
+            let started = std::time::Instant::now();
+            for (i, au) in aus.iter().enumerate() {
+                d.decode(au, i as i64, &mut |_| pics += 1);
+            }
+            let secs = started.elapsed().as_secs_f64();
+            eprintln!("{threads} threads: {secs:.2} s, {:.0} pictures/s ({pics} pictures)", pics as f64 / secs);
         }
     }
 }

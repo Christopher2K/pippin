@@ -6,7 +6,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use winit::window::Window;
 
-use crate::video::decoder::Picture;
+use crate::video::decoder::{Picture, PlaneRef};
 
 const SHADER: &str = r#"
 @group(0) @binding(0) var y_tex: texture_2d<f32>;
@@ -278,7 +278,7 @@ impl Renderer {
             self.planes = Some(self.make_planes(pic.width, height, chroma));
         }
         let planes = self.planes.as_ref().unwrap();
-        let write = |t: &wgpu::Texture, data: &[u8], w: u32, h: u32, tex_h: u32| {
+        let write = |t: &wgpu::Texture, plane: PlaneRef, w: u32, h: u32, tex_h: u32| {
             let y0 = tile * h;
             if y0 >= tex_h {
                 return;
@@ -291,14 +291,14 @@ impl Renderer {
                     origin: wgpu::Origin3d { x: 0, y: y0, z: 0 },
                     aspect: wgpu::TextureAspect::All,
                 },
-                &data[..(w * rows) as usize],
-                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w), rows_per_image: None },
+                &plane.data[..((rows - 1) * plane.stride + w) as usize],
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(plane.stride), rows_per_image: None },
                 wgpu::Extent3d { width: w, height: rows, depth_or_array_layers: 1 },
             );
         };
-        write(&planes.textures[0], &pic.y, pic.width, pic.height, planes.height);
-        write(&planes.textures[1], &pic.u, pic.chroma_width, pic.chroma_height, planes.chroma.1);
-        write(&planes.textures[2], &pic.v, pic.chroma_width, pic.chroma_height, planes.chroma.1);
+        write(&planes.textures[0], pic.plane(0), pic.width, pic.height, planes.height);
+        write(&planes.textures[1], pic.plane(1), pic.chroma_width, pic.chroma_height, planes.chroma.1);
+        write(&planes.textures[2], pic.plane(2), pic.chroma_width, pic.chroma_height, planes.chroma.1);
     }
 
     /// The letterboxed rectangle the canvas occupies.

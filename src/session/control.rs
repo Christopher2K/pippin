@@ -23,7 +23,7 @@ pub(super) struct ControlReader {
     clipboard_out: Sender<String>,
     feedback: Sender<Feedback>,
     clipboard: Reassembler,
-    cursors: HashMap<u32, Arc<Vec<u8>>>,
+    cursors: HashMap<u32, CursorShape>,
     backing: Option<(u16, u16)>,
 }
 
@@ -137,25 +137,35 @@ impl ControlReader {
     }
 
     fn cursor(&mut self, c: &CursorRect) {
-        let rgba = if c.compressed.is_empty() {
-            self.cursors.get(&c.cache_id).cloned()
+        let shape = if c.compressed.is_empty() {
+            // Cache hit: the host sends only the id, with a 0×0 size.
+            self.cursors.get(&c.cache_id).cloned().map(|s| CursorShape { fresh: false, ..s })
         } else {
             decode_cursor(c).map(|rgba| {
-                let rgba = Arc::new(rgba);
+                let shape = CursorShape {
+                    cache_id: c.cache_id,
+                    width: c.size.0,
+                    height: c.size.1,
+                    hotspot: c.hotspot,
+                    rgba: Some(Arc::new(rgba)),
+                    fresh: true,
+                };
                 if self.cursors.len() >= MAX_CACHED_CURSORS {
                     self.cursors.clear();
                 }
-                self.cursors.insert(c.cache_id, rgba.clone());
-                rgba
+                self.cursors.insert(c.cache_id, shape.clone());
+                shape
             })
         };
-        self.shared.sink.emit(Event::Cursor(CursorShape {
+        let shape = shape.unwrap_or(CursorShape {
             cache_id: c.cache_id,
             width: c.size.0,
             height: c.size.1,
             hotspot: c.hotspot,
-            rgba,
-        }));
+            rgba: None,
+            fresh: false,
+        });
+        self.shared.sink.emit(Event::Cursor(shape));
     }
 
     fn layout(&mut self, l: DisplayLayout) {

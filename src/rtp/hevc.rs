@@ -57,6 +57,64 @@ pub fn pps_id(nal: &[u8]) -> Option<u32> {
     Some((1u32 << lz) - 1 + v)
 }
 
+/// Within-picture parallelism a PPS enables: `(tiles, wavefront)`. Either
+/// lets libavcodec's slice threading split a single-slice picture.
+pub fn pps_parallelism(nal: &[u8]) -> Option<(bool, bool)> {
+    let mut rbsp = Vec::with_capacity(32);
+    let mut zeros = 0;
+    for &b in nal.get(2..)?.iter().take(64) {
+        if zeros >= 2 && b == 3 {
+            zeros = 0;
+            continue;
+        }
+        zeros = if b == 0 { zeros + 1 } else { 0 };
+        rbsp.push(b);
+    }
+    let mut i = 0usize;
+    let mut u = |n: usize| -> Option<u32> {
+        let mut v = 0;
+        for _ in 0..n {
+            v = (v << 1) | ((rbsp.get(i / 8)? >> (7 - i % 8)) & 1) as u32;
+            i += 1;
+        }
+        Some(v)
+    };
+    let ue = |u: &mut dyn FnMut(usize) -> Option<u32>| -> Option<u32> {
+        let mut lz = 0;
+        while u(1)? == 0 {
+            lz += 1;
+            if lz > 31 {
+                return None;
+            }
+        }
+        Some((1u32 << lz) - 1 + u(lz)?)
+    };
+    ue(&mut u)?; // pps_pic_parameter_set_id
+    ue(&mut u)?; // pps_seq_parameter_set_id
+    u(1)?; // dependent_slice_segments_enabled_flag
+    u(1)?; // output_flag_present_flag
+    u(3)?; // num_extra_slice_header_bits
+    u(1)?; // sign_data_hiding_enabled_flag
+    u(1)?; // cabac_init_present_flag
+    ue(&mut u)?; // num_ref_idx_l0_default_active_minus1
+    ue(&mut u)?; // num_ref_idx_l1_default_active_minus1
+    ue(&mut u)?; // init_qp_minus26 (se; only the length matters)
+    u(1)?; // constrained_intra_pred_flag
+    u(1)?; // transform_skip_enabled_flag
+    if u(1)? == 1 {
+        ue(&mut u)?; // diff_cu_qp_delta_depth
+    }
+    ue(&mut u)?; // pps_cb_qp_offset
+    ue(&mut u)?; // pps_cr_qp_offset
+    u(1)?; // pps_slice_chroma_qp_offsets_present_flag
+    u(1)?; // weighted_pred_flag
+    u(1)?; // weighted_bipred_flag
+    u(1)?; // transquant_bypass_enabled_flag
+    let tiles = u(1)? == 1;
+    let wpp = u(1)? == 1;
+    Some((tiles, wpp))
+}
+
 /// DONL of the first packet of an access unit.
 pub fn first_donl(payloads: &[(u16, &[u8])]) -> Option<u16> {
     let (_, p) = payloads.first()?;
@@ -155,6 +213,13 @@ mod tests {
         // Missing middle fragment drops the NAL.
         let gap: Vec<(u16, &[u8])> = vec![(1, &f1), (3, &f3)];
         assert!(depayload(&gap).is_empty());
+    }
+
+    #[test]
+    fn reads_pps_parallelism() {
+        // x265 4:4:4 PPS with wavefront parallelism on and off.
+        assert_eq!(pps_parallelism(&[0x44, 0x01, 0xc1, 0x72, 0x86, 0x0c, 0x46, 0x24]), Some((false, true)));
+        assert_eq!(pps_parallelism(&[0x44, 0x01, 0xc1, 0x72, 0x86, 0x0c, 0x42, 0x24]), Some((false, false)));
     }
 
     #[test]

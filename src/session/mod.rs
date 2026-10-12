@@ -44,11 +44,15 @@ pub struct Config {
     pub password: String,
     pub session_mode: SessionMode,
     pub hardware_decode: bool,
+    /// Software decoder threads; see `DecoderOptions`.
+    pub decode_threads: u32,
     pub warmup: bool,
 }
 
 /// A cursor shape from the host. `rgba` is `None` when the host referenced
 /// a cache entry we never received; the UI then shows its default cursor.
+/// Cache hits carry the size and hotspot remembered from the original
+/// image, since the host sends them as 0×0.
 #[derive(Clone)]
 pub struct CursorShape {
     pub cache_id: u32,
@@ -56,6 +60,9 @@ pub struct CursorShape {
     pub height: u16,
     pub hotspot: (u16, u16),
     pub rgba: Option<Arc<Vec<u8>>>,
+    /// The image arrived in this message rather than from the cache, so any
+    /// cursor the UI built for `cache_id` is stale.
+    pub fresh: bool,
 }
 
 pub enum Event {
@@ -357,8 +364,11 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
     }
     {
         let (shared, fb) = (shared.clone(), fb_tx.clone());
-        let hw = cfg.hardware_decode;
-        spawn(threads, "decoder", move || media::decoder(shared, dec_rx, fb, hw));
+        let opts = crate::video::decoder::DecoderOptions {
+            prefer_hw: cfg.hardware_decode,
+            threads: cfg.decode_threads,
+        };
+        spawn(threads, "decoder", move || media::decoder(shared, dec_rx, fb, opts));
     }
     {
         let (shared, sock) = (shared.clone(), ctrl_sock.try_clone()?);

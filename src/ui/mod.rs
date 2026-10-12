@@ -151,12 +151,14 @@ impl App {
 
     fn set_cursor(&mut self, el: &ActiveEventLoop, c: CursorShape) {
         let Some(w) = &self.window else { return };
-        if let Some(cur) = self.cursors.get(&c.cache_id)
-            && c.rgba.is_none() {
+        if !c.fresh
+            && let Some(cur) = self.cursors.get(&c.cache_id) {
+                w.set_cursor_visible(true);
                 w.set_cursor(cur.clone());
                 return;
             }
         let Some(rgba) = c.rgba else {
+            w.set_cursor_visible(true);
             w.set_cursor(CursorIcon::Default);
             return;
         };
@@ -258,8 +260,14 @@ impl ApplicationHandler<Event> for App {
             }
             WindowEvent::RedrawRequested => {
                 if let (Some(r), Some(s)) = (&mut self.renderer, &self.session) {
-                    for (tile, pic) in s.frames().take() {
+                    let started = Instant::now();
+                    let frames = s.frames().take();
+                    let n = frames.len();
+                    for (tile, pic) in frames {
                         r.upload(tile, &pic);
+                    }
+                    if n > 0 {
+                        tracing::trace!("uploaded {n} tiles in {:.2} ms", started.elapsed().as_secs_f64() * 1000.0);
                     }
                 }
                 if let Some(r) = &mut self.renderer {

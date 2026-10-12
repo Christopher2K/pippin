@@ -53,6 +53,10 @@ struct Cli {
     /// Decode on the CPU even if CUDA is available.
     #[arg(long)]
     no_hw: bool,
+    /// Software decode threads. Pictures are split by CTU row (wavefront),
+    /// so more threads add no latency; gains level off around 4-5.
+    #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u32).range(1..=16))]
+    decode_threads: u32,
     /// Skip the preliminary connection that wakes the host's daemon.
     #[arg(long)]
     no_warmup: bool,
@@ -114,6 +118,7 @@ fn main() -> Result<()> {
         password,
         session_mode: cli.session,
         hardware_decode: !cli.no_hw,
+        decode_threads: cli.decode_threads,
         warmup: !cli.no_warmup,
     };
     let opts = ui::Options {

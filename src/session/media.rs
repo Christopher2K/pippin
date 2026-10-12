@@ -14,7 +14,7 @@ use crate::proto::offers::{MediaOffer, SRTP_BLOB_LEN};
 use crate::rtp::assembler::{AccessUnit, Assembler, TileMap};
 use crate::rtp::srtp::{SrtcpReceiver, SrtcpSender, SrtpReceiver, SrtpSender};
 use crate::rtp::{hevc, rtcp};
-use crate::video::decoder::{Backend, Decoder, Picture};
+use crate::video::decoder::{Backend, Decoder, DecoderOptions, Picture};
 
 /// Requests from the media threads to the feedback sender.
 pub enum Feedback {
@@ -208,6 +208,9 @@ impl ParamSets {
             hevc::NAL_VPS => self.vps = Some(nal.to_vec()),
             hevc::NAL_SPS => self.sps = Some(nal.to_vec()),
             hevc::NAL_PPS => {
+                if let Some((tiles, wpp)) = hevc::pps_parallelism(nal) {
+                    tracing::debug!("PPS: tiles={tiles} wavefront={wpp}");
+                }
                 if let Some(id) = hevc::pps_id(nal) {
                     self.pps.insert(id, nal.to_vec());
                 }
@@ -234,6 +237,7 @@ const CUDA_GRACE_AUS: u32 = 120;
 
 struct DecodeLoop {
     shared: Arc<Shared>,
+    opts: DecoderOptions,
     fb: Sender<Feedback>,
     decoder: Decoder,
     params: ParamSets,
@@ -243,11 +247,69 @@ struct DecodeLoop {
     pts: i64,
     origin: HashMap<i64, (usize, Option<u16>)>,
     fed_without_output: Option<u32>,
+    stats: DecodeStats,
+    /// MACSHARE_DUMP_HEVC: every access unit fed to the decoder, as Annex B,
+    /// for offline analysis (ffmpeg -bsf:v trace_headers) and benchmarks.
+    dump: Option<std::io::BufWriter<std::fs::File>>,
+}
+
+fn open_dump() -> Option<std::io::BufWriter<std::fs::File>> {
+    let path = std::env::var_os("MACSHARE_DUMP_HEVC")?;
+    match std::fs::File::create(&path) {
+        Ok(f) => {
+            tracing::info!("writing decoder input to {}", path.to_string_lossy());
+            Some(std::io::BufWriter::new(f))
+        }
+        Err(e) => {
+            tracing::warn!("MACSHARE_DUMP_HEVC: {e}");
+            None
+        }
+    }
+}
+
+const STATS_EVERY: Duration = Duration::from_secs(5);
+
+/// Decoder throughput, logged at debug level so slow decoding is visible.
+struct DecodeStats {
+    since: Instant,
+    aus: u32,
+    slices: u32,
+    pictures: u32,
+    busy: Duration,
+    worst: Duration,
+}
+
+impl DecodeStats {
+    fn new() -> Self {
+        Self { since: Instant::now(), aus: 0, slices: 0, pictures: 0, busy: Duration::ZERO, worst: Duration::ZERO }
+    }
+
+    fn record(&mut self, slices: usize, pictures: usize, took: Duration) {
+        self.aus += 1;
+        self.slices += slices as u32;
+        self.pictures += pictures as u32;
+        self.busy += took;
+        self.worst = self.worst.max(took);
+        let elapsed = self.since.elapsed();
+        if elapsed >= STATS_EVERY {
+            let secs = elapsed.as_secs_f64();
+            tracing::debug!(
+                "decode: {:.1} AU/s, {:.1} slices/AU, {:.1} pictures/s, avg {:.1} ms, worst {:.1} ms, busy {:.0}%",
+                self.aus as f64 / secs,
+                self.slices as f64 / self.aus as f64,
+                self.pictures as f64 / secs,
+                self.busy.as_secs_f64() * 1000.0 / self.aus as f64,
+                self.worst.as_secs_f64() * 1000.0,
+                self.busy.as_secs_f64() / secs * 100.0,
+            );
+            *self = Self::new();
+        }
+    }
 }
 
 impl DecodeLoop {
     fn restart(&mut self, backend: Backend) {
-        match Decoder::new(backend == Backend::Cuda) {
+        match Decoder::new(DecoderOptions { prefer_hw: backend == Backend::Cuda, ..self.opts }) {
             Ok(d) => self.decoder = d,
             Err(e) => tracing::error!("restarting decoder: {e:#}"),
         }
@@ -294,7 +356,13 @@ impl DecodeLoop {
         self.pts += 1;
         self.origin.insert(self.pts, (tile, au.donl));
         let mut pictures = Vec::new();
+        if let Some(d) = self.dump.as_mut() {
+            let _ = std::io::Write::write_all(d, &annexb);
+        }
+        let started = Instant::now();
         let ok = self.decoder.decode(&annexb, self.pts, &mut |p| pictures.push(p));
+        let slices = au.nalus.iter().filter(|n| hevc::is_slice(n)).count();
+        self.stats.record(slices, pictures.len(), started.elapsed());
         if !ok {
             self.awaiting_idr = true;
             let _ = self.fb.send(Feedback::Keyframe(Some(tile)));
@@ -335,8 +403,8 @@ impl DecodeLoop {
     }
 }
 
-pub(super) fn decoder(shared: Arc<Shared>, rx: Receiver<DecoderMsg>, fb: Sender<Feedback>, prefer_hw: bool) {
-    let decoder = match Decoder::new(prefer_hw) {
+pub(super) fn decoder(shared: Arc<Shared>, rx: Receiver<DecoderMsg>, fb: Sender<Feedback>, opts: DecoderOptions) {
+    let decoder = match Decoder::new(opts) {
         Ok(d) => d,
         Err(e) => {
             shared.sink.emit(Event::Closed(Some(format!("video decoder: {e:#}"))));
@@ -347,6 +415,7 @@ pub(super) fn decoder(shared: Arc<Shared>, rx: Receiver<DecoderMsg>, fb: Sender<
     let cuda = decoder.backend() == Backend::Cuda;
     let mut st = DecodeLoop {
         shared: shared.clone(),
+        opts,
         fb,
         decoder,
         params: ParamSets::default(),
@@ -355,6 +424,8 @@ pub(super) fn decoder(shared: Arc<Shared>, rx: Receiver<DecoderMsg>, fb: Sender<
         pts: 0,
         origin: HashMap::new(),
         fed_without_output: cuda.then_some(0),
+        stats: DecodeStats::new(),
+        dump: open_dump(),
     };
     while !shared.stopped() {
         match rx.recv_timeout(Duration::from_millis(200)) {
