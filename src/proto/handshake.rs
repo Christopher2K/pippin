@@ -295,7 +295,13 @@ pub fn connect(p: &ConnectParams) -> Result<Negotiated> {
     let keys = read_record_keys(&mut s, &auth_key).map_err(|e| {
         // A console user who refuses the share request just drops us.
         let eof = e.downcast_ref::<std::io::Error>().is_some_and(|io| io.kind() == std::io::ErrorKind::UnexpectedEof);
-        if shared_console && eof { e.context(Failure::ShareDeclined) } else { e }
+        if shared_console && eof {
+            // A guess from the timing; keep the evidence.
+            tracing::info!("connection closed before encryption keys, assuming the share was declined: {e:#}");
+            e.context(Failure::ShareDeclined)
+        } else {
+            e
+        }
     })?;
     let mut sealer = RecordSealer::new(&keys);
     let mut opener = RecordOpener::new(&keys);
