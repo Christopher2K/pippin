@@ -118,6 +118,16 @@ fn main() -> std::process::ExitCode {
             // everything are at debug level.
             tracing::debug!("{e:?}");
             eprintln!("macshare: {e:#}");
+            if !std::io::stdin().is_terminal() {
+                // Launched from a desktop entry: stderr goes nowhere, so try
+                // a notification. Missing notify-send is fine.
+                let _ = std::process::Command::new("notify-send")
+                    .args(["macshare", &format!("{e:#}")])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
             std::process::ExitCode::FAILURE
         }
     }
@@ -185,8 +195,8 @@ fn run() -> Result<()> {
     connect(&mut event_loop, &cli, &store, &host, &user, password, source, cli.save_password, tty).map(drop)
 }
 
-/// Shows the connect dialog until a session runs or the user cancels; a
-/// rejected password brings the dialog back with an error line.
+/// Shows the connect dialog until a session runs or the user cancels; any
+/// failure brings the dialog back with the error under the fields.
 fn dialog_loop(
     event_loop: &mut winit::event_loop::EventLoop<ui::Tagged>,
     cli: &Cli,
@@ -206,9 +216,11 @@ fn dialog_loop(
         let source = credentials::Source::Dialog;
         match connect(event_loop, cli, store, &f.host, &f.user, f.password.clone(), source, f.save, false)? {
             Outcome::Done => return Ok(()),
-            Outcome::Retry(msg) => {
+            Outcome::Retry { msg, wrong_password } => {
                 error = Some(msg);
-                fields = ui::dialog::Fields { password: String::new(), ..f };
+                // Keep a password that may well be right for another try.
+                let password = if wrong_password { String::new() } else { f.password.clone() };
+                fields = ui::dialog::Fields { password, ..f };
             }
         }
     }
@@ -216,12 +228,12 @@ fn dialog_loop(
 
 enum Outcome {
     Done,
-    /// The details didn't work; ask again with this message.
-    Retry(String),
+    /// The attempt failed; ask again with this message.
+    Retry { msg: String, wrong_password: bool },
 }
 
-/// Runs one session. For a dialog password, auth rejection and an
-/// unresolvable host come back as `Retry` so the dialog can ask again.
+/// Runs one session. For a dialog password every failure comes back as
+/// `Retry` so the dialog can show it and ask again.
 #[allow(clippy::too_many_arguments)]
 fn connect(
     event_loop: &mut winit::event_loop::EventLoop<ui::Tagged>,
@@ -237,7 +249,7 @@ fn connect(
     let from_dialog = source == credentials::Source::Dialog;
     let host = match resolve_ipv4(host_name, cli.port) {
         Ok(h) => h,
-        Err(e) if from_dialog => return Ok(Outcome::Retry(format!("{e:#}"))),
+        Err(e) if from_dialog => return Ok(Outcome::Retry { msg: format!("{e:#}"), wrong_password: false }),
         Err(e) => return Err(e),
     };
     let account = credentials::account(user, host_name, cli.port);
@@ -294,8 +306,13 @@ fn connect(
             credentials::confirm_save(&mut std::io::stdin().lock())
         });
     }
-    if result.is_err() && from_dialog && rejected.load(Ordering::SeqCst) {
-        return Ok(Outcome::Retry("Wrong user name or password".into()));
+    match result {
+        Err(e) if from_dialog => {
+            tracing::debug!("{e:?}");
+            let wrong_password = rejected.load(Ordering::SeqCst);
+            let msg = if wrong_password { "Wrong user name or password".into() } else { format!("{e:#}") };
+            Ok(Outcome::Retry { msg, wrong_password })
+        }
+        r => r.map(|()| Outcome::Done),
     }
-    result.map(|()| Outcome::Done)
 }

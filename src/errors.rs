@@ -57,7 +57,7 @@ pub enum UserError {
     AuthFailed(Option<String>),
     #[error(
         "The user at {0}'s screen declined (or didn't answer) the request to share. \
-         Try again, or use --session alt to log in separately."
+         Try again, or log in to a separate session instead."
     )]
     ShareDeclined(String),
     #[error(
