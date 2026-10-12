@@ -38,6 +38,9 @@ pub struct ConnectParams {
     pub session_mode: SessionMode,
     pub display: DisplayRequest,
     pub audio: bool,
+    /// Shown each control connection as soon as it's open, so the caller
+    /// can shut it down to abort a handshake stuck waiting on the host.
+    pub on_open: Option<Box<dyn Fn(&TcpStream) + Send + Sync>>,
 }
 
 /// An authenticated, encrypted control connection with media negotiated.
@@ -81,9 +84,13 @@ fn banner(s: &mut TcpStream) -> Result<Vec<u8>> {
     Ok(read_vec(s, n[0] as usize)?)
 }
 
-fn open(addr: SocketAddrV4) -> Result<TcpStream> {
+fn open(p: &ConnectParams) -> Result<TcpStream> {
+    let addr = p.addr;
     let mut s = TcpStream::connect_timeout(&addr.into(), IO_TIMEOUT)
         .with_context(|| format!("connecting to {addr}"))?;
+    if let Some(f) = &p.on_open {
+        f(&s);
+    }
     s.set_nodelay(true)?;
     s.set_read_timeout(Some(IO_TIMEOUT))?;
     s.set_write_timeout(Some(IO_TIMEOUT))?;
@@ -97,7 +104,7 @@ fn open(addr: SocketAddrV4) -> Result<TcpStream> {
 /// Opens a connection and authenticates, preferring SRP and falling back to
 /// the RSA1/AES path on a fresh connection when the host lacks SRP.
 fn authenticate(p: &ConnectParams) -> Result<(TcpStream, [u8; 16])> {
-    let mut s = open(p.addr)?;
+    let mut s = open(p)?;
     match auth::srp_auth(&mut s, &p.user, &p.password) {
         Ok(key) => {
             tracing::info!("authenticated (SRP)");
@@ -108,7 +115,7 @@ fn authenticate(p: &ConnectParams) -> Result<(TcpStream, [u8; 16])> {
         }
         Err(e) => return Err(e.context("SRP authentication failed")),
     }
-    let mut s = open(p.addr)?;
+    let mut s = open(p)?;
     let key = auth::nonsrp_auth(&mut s, &p.user, &p.password).context("legacy authentication failed")?;
     tracing::info!("authenticated (legacy RSA1)");
     Ok((s, key))

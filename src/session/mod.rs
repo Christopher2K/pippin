@@ -41,6 +41,10 @@ use crate::errors::Failure;
 /// How long to wait for the first video packet before giving up.
 const FIRST_VIDEO_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// How long shutdown waits for a session that is still connecting before
+/// leaving it to finish in the background.
+const DETACH_AFTER: Duration = Duration::from_millis(250);
+
 /// How long sent control data may go unacknowledged before the connection
 /// counts as dead.
 const CONTROL_ACK_TIMEOUT: Duration = Duration::from_secs(10);
@@ -176,6 +180,8 @@ pub struct Shared {
     extended_seqs: Mutex<HashMap<u32, u32>>,
     sender_reports: Mutex<HashMap<u32, (u32, Instant)>>,
     canvas: Mutex<Option<(u32, u32)>>,
+    /// The control connection while the handshake runs, for shutdown().
+    connecting: Mutex<Option<TcpStream>>,
 }
 
 impl Shared {
@@ -225,6 +231,7 @@ impl Session {
             extended_seqs: Mutex::new(HashMap::new()),
             sender_reports: Mutex::new(HashMap::new()),
             canvas: Mutex::new(None),
+            connecting: Mutex::new(None),
         });
         let threads = Arc::new(Mutex::new(Vec::new()));
         let session = Session { shared: shared.clone(), threads: threads.clone() };
@@ -287,18 +294,43 @@ impl Session {
     /// Stops every session thread and waits for them, so the sockets are
     /// closed and the UDP ports free once this returns. Also needed after
     /// the session stopped itself, before a new one binds the same ports.
+    ///
+    /// A session still connecting can be stuck for a while (TCP connect,
+    /// waiting for the console user to accept), so after aborting what it
+    /// can, shutdown gives it a moment and then leaves it to exit on its own
+    /// via the stop flag rather than freezing the window.
     pub fn shutdown(&self) {
-        if !self.shared.stop.swap(true, Ordering::AcqRel)
-            && let Some(c) = self.control() {
+        let first = !self.shared.stop.swap(true, Ordering::AcqRel);
+        if first && let Some(c) = self.control() {
             // Reset rather than close so the host tears the session down
             // immediately instead of waiting out its own timeouts.
             let w = c.writer.lock();
             let _ = socket2::SockRef::from(&w.0).set_linger(Some(Duration::ZERO));
             let _ = w.0.shutdown(std::net::Shutdown::Both);
+        }
+        if self.control().is_none() {
+            if let Some(s) = self.shared.connecting.lock().take() {
+                let _ = s.shutdown(std::net::Shutdown::Both);
             }
-        let threads: Vec<_> = self.threads.lock().drain(..).collect();
-        for t in threads {
-            let _ = t.join();
+            let deadline = Instant::now() + DETACH_AFTER;
+            while !self.threads.lock().iter().all(|t| t.is_finished()) {
+                if Instant::now() >= deadline {
+                    tracing::debug!("session still connecting; leaving it to stop on its own");
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        // Threads can register more threads while we join (the control
+        // thread spawns the media threads), so drain until none are left.
+        loop {
+            let threads: Vec<_> = self.threads.lock().drain(..).collect();
+            if threads.is_empty() {
+                break;
+            }
+            for t in threads {
+                let _ = t.join();
+            }
         }
     }
 }
@@ -362,6 +394,16 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
         session_mode: cfg.session_mode,
         display,
         audio: false,
+        on_open: Some(Box::new({
+            let shared = shared.clone();
+            move |s: &TcpStream| {
+                *shared.connecting.lock() = s.try_clone().ok();
+                // Closed while we were connecting: abort right away.
+                if shared.stopped() {
+                    let _ = s.shutdown(std::net::Shutdown::Both);
+                }
+            }
+        })),
     };
     let negotiated = handshake::connect(&params);
     punching.store(false, Ordering::Relaxed);
@@ -373,7 +415,11 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
             Err(_) => {}
         }
     }
+    *shared.connecting.lock() = None;
     let neg = negotiated?;
+    if shared.stopped() {
+        return Ok(());
+    }
     tracing::debug!("server framebuffer {}x{}", neg.server_size.0, neg.server_size.1);
 
     if let Some(c) = neg.canvas {
@@ -394,6 +440,12 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
         offer: neg.offer.clone(),
     });
     let _ = shared.control.set(control.clone());
+    // shutdown() may have run between the check above and the set, seen no
+    // control connection, and left us to finish on our own.
+    if shared.stopped() {
+        let _ = control.writer.lock().0.shutdown(std::net::Shutdown::Both);
+        return Ok(());
+    }
 
     let (fb_tx, fb_rx): (Sender<Feedback>, Receiver<Feedback>) = crossbeam_channel::unbounded();
     let (dec_tx, dec_rx) = crossbeam_channel::bounded(256);
