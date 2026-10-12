@@ -182,6 +182,8 @@ pub struct Shared {
     canvas: Mutex<Option<(u32, u32)>>,
     /// The control connection while the handshake runs, for shutdown().
     connecting: Mutex<Option<TcpStream>>,
+    /// Clones of the media sockets, so shutdown() can wake their readers.
+    udp: Mutex<Vec<UdpSocket>>,
 }
 
 impl Shared {
@@ -232,6 +234,7 @@ impl Session {
             sender_reports: Mutex::new(HashMap::new()),
             canvas: Mutex::new(None),
             connecting: Mutex::new(None),
+            udp: Mutex::new(Vec::new()),
         });
         let threads = Arc::new(Mutex::new(Vec::new()));
         let session = Session { shared: shared.clone(), threads: threads.clone() };
@@ -239,6 +242,9 @@ impl Session {
             .name("control".into())
             .spawn(move || {
                 let host = cfg.host;
+                // A session shut down while still connecting may hold the
+                // UDP ports until its handshake gives up; wait for it.
+                join_detached();
                 let result = run(cfg, display, shared.clone(), &threads);
                 if !shared.stopped() {
                     // The reader only returns Ok once stopped; treat anything
@@ -312,23 +318,61 @@ impl Session {
             if let Some(s) = self.shared.connecting.lock().take() {
                 let _ = s.shutdown(std::net::Shutdown::Both);
             }
+            self.close_udp();
             let deadline = Instant::now() + DETACH_AFTER;
             while !self.threads.lock().iter().all(|t| t.is_finished()) {
                 if Instant::now() >= deadline {
                     tracing::debug!("session still connecting; leaving it to stop on its own");
+                    // The next session joins it before binding the ports.
+                    DETACHED.lock().push(self.threads.clone());
                     return;
                 }
                 thread::sleep(Duration::from_millis(10));
             }
         }
-        // Threads can register more threads while we join (the control
-        // thread spawns the media threads), so drain until none are left.
-        loop {
-            let threads: Vec<_> = self.threads.lock().drain(..).collect();
-            if threads.is_empty() {
-                break;
-            }
-            for t in threads {
+        join_all(&self.threads);
+        self.close_udp();
+    }
+
+    /// Wakes anything blocked on the media sockets and drops our clones.
+    /// The ports themselves are freed once the threads holding the other
+    /// handles exit.
+    fn close_udp(&self) {
+        for s in self.shared.udp.lock().drain(..) {
+            let _ = socket2::SockRef::from(&s).shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
+
+type Threads = Arc<Mutex<Vec<JoinHandle<()>>>>;
+
+/// Sessions that shutdown() left to finish on their own.
+static DETACHED: Mutex<Vec<Threads>> = Mutex::new(Vec::new());
+
+/// Waits for every detached session. Their stop flag is set, so each exits
+/// within its handshake's I/O timeout.
+fn join_detached() {
+    let pending: Vec<_> = DETACHED.lock().drain(..).collect();
+    if !pending.is_empty() {
+        tracing::debug!("waiting for a previous session to finish connecting");
+    }
+    for threads in pending {
+        join_all(&threads);
+    }
+}
+
+fn join_all(threads: &Mutex<Vec<JoinHandle<()>>>) {
+    // Threads can register more threads while we join (the control thread
+    // spawns the media threads), so drain until none are left.
+    loop {
+        let batch: Vec<_> = threads.lock().drain(..).collect();
+        if batch.is_empty() {
+            break;
+        }
+        for t in batch {
+            // A session detached before its control thread got going can
+            // find its own handle here; that one can't be joined.
+            if t.thread().id() != thread::current().id() {
                 let _ = t.join();
             }
         }
@@ -338,7 +382,9 @@ impl Session {
 fn bind_udp(port: u16) -> Result<UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
     let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-    s.set_reuse_address(true)?;
+    // No SO_REUSEADDR: UDP has no TIME_WAIT to skip, and on Linux it would
+    // let a second socket share the port and silently steal the video. A
+    // leftover bind should fail here instead.
     let _ = s.set_recv_buffer_size(8 << 20);
     s.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port).into())
         .with_context(|| format!("binding UDP port {port} (is another screen-sharing client running?)"))?;
@@ -368,6 +414,11 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
     // must exist before the handshake.
     let ctrl_sock = bind_udp(cfg.port)?;
     let video_sock = bind_udp(cfg.port + 1)?;
+    shared.udp.lock().extend([ctrl_sock.try_clone()?, video_sock.try_clone()?]);
+    if shared.stopped() {
+        // shutdown() may have closed the list before we filled it.
+        return Ok(());
+    }
 
     if cfg.warmup
         && let Err(e) = handshake::warmup(addr) {
@@ -415,7 +466,8 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
     let negotiated = handshake::connect(&params);
     punching.store(false, Ordering::Relaxed);
     let _ = punch.join();
-    if let Some(hook) = &cfg.on_auth {
+    // A stopped session's verdict is stale: the caller has moved on.
+    if let Some(hook) = cfg.on_auth.as_ref().filter(|_| !shared.stopped()) {
         match &negotiated {
             Ok(_) => hook(true),
             Err(e) => {
