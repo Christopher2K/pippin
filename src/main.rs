@@ -242,37 +242,29 @@ fn connect(
     };
     let account = credentials::account(user, host_name, cli.port);
     let rejected = Arc::new(AtomicBool::new(false));
-    // The hook runs for every reconnect too; save (or ask) only for the
-    // first success. One connect() call is one password, so a new password
-    // typed into the dialog after a rejection gets its own chance.
-    let save_handled = Arc::new(AtomicBool::new(false));
+    // Set on the first accepted login. The hook runs for every reconnect
+    // too, so saving happens at most once per password (one connect() call
+    // is one password; a new one typed into the dialog after a rejection
+    // gets its own chance).
+    let authed = Arc::new(AtomicBool::new(false));
     let on_auth: session::AuthHook = {
-        let (store, password, rejected) = (store.clone(), password.clone(), rejected.clone());
+        let (store, account, password) = (store.clone(), account.clone(), password.clone());
+        let (rejected, authed) = (rejected.clone(), authed.clone());
         Arc::new(move |ok| {
             rejected.store(!ok, Ordering::SeqCst);
-            if ok && save_handled.swap(true, Ordering::SeqCst) {
+            if ok && (authed.swap(true, Ordering::SeqCst) || !save) {
+                // Already handled, or a question for after the window closes.
                 return;
             }
-            // Runs on the control thread; asking must not hold up the session.
-            let asks = ok && !save && credentials::should_save(source, save, interactive);
-            let (store, account, password) = (store.clone(), account.clone(), password.clone());
-            let finish = move || {
-                credentials::after_auth(store.as_ref(), &account, &password, source, ok, save, || {
-                    interactive && credentials::confirm_save(&mut std::io::stdin().lock())
-                })
-            };
-            if asks {
-                std::thread::spawn(finish);
-            } else {
-                finish();
-            }
+            // Runs on the control thread; never asks here.
+            credentials::after_auth(store.as_ref(), &account, &password, source, ok, save, || false);
         })
     };
     let cfg = session::Config {
         host,
         port: cli.port,
         user: user.to_owned(),
-        password,
+        password: password.clone(),
         session_mode: cli.session,
         hardware_decode: !cli.no_hw,
         decode_threads: cli.decode_threads,
@@ -289,6 +281,18 @@ fn connect(
         reconnect: !cli.no_reconnect,
     };
     let result = ui::run(event_loop, cfg, opts);
+    // A terminal-prompted password that worked is offered for saving once
+    // the window has closed: asking while it is open would interleave with
+    // the log output on a detached thread and go unseen behind the window.
+    if authed.load(Ordering::SeqCst)
+        && !rejected.load(Ordering::SeqCst)
+        && !save
+        && credentials::should_save(source, save, interactive)
+    {
+        credentials::after_auth(store.as_ref(), &account, &password, source, true, save, || {
+            credentials::confirm_save(&mut std::io::stdin().lock())
+        });
+    }
     if result.is_err() && from_dialog && rejected.load(Ordering::SeqCst) {
         return Ok(Outcome::Retry("Wrong user name or password".into()));
     }
