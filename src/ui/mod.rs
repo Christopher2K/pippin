@@ -2,6 +2,7 @@
 //! the host's virtual display sized to the window.
 
 mod keymap;
+mod reconnect;
 mod render;
 
 use std::collections::HashMap;
@@ -19,6 +20,7 @@ use winit::window::{CursorIcon, CustomCursor, Window, WindowId};
 
 use crate::proto::messages::{BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN_SCROLL_DOWN, BTN_SCROLL_UP, DisplayRequest};
 use crate::session::{Config, CursorShape, Event, EventSink, Session};
+use reconnect::{OnEnd, Reconnector};
 use render::Renderer;
 
 /// Settle time before asking the host to follow a window resize; each
@@ -40,24 +42,41 @@ pub struct Options {
     pub scale: Option<f64>,
     pub auto_resize: bool,
     pub swap_ctrl_cmd: bool,
+    /// Start a new session when an established one drops.
+    pub reconnect: bool,
 }
 
-struct ProxySink(EventLoopProxy<Event>);
+/// A session event tagged with the session it came from, so stragglers from
+/// a replaced session are ignored.
+struct Tagged {
+    generation: u64,
+    event: Event,
+}
+
+struct ProxySink {
+    proxy: EventLoopProxy<Tagged>,
+    generation: u64,
+}
 
 impl EventSink for ProxySink {
     fn emit(&self, event: Event) {
-        let _ = self.0.send_event(event);
+        let _ = self.proxy.send_event(Tagged { generation: self.generation, event });
     }
 }
 
 struct App {
     cfg: Config,
     opts: Options,
-    proxy: EventLoopProxy<Event>,
+    proxy: EventLoopProxy<Tagged>,
     instance: wgpu::Instance,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     session: Option<Session>,
+    /// Bumped for every session started.
+    generation: u64,
+    reconnector: Reconnector,
+    /// When to start the next reconnect attempt.
+    retry_due: Option<Instant>,
     /// Error that ended the session, reported after the window closes.
     error: Option<String>,
 
@@ -188,13 +207,52 @@ impl App {
         }
     }
 
+    fn start_session(&mut self) {
+        let Some(w) = &self.window else { return };
+        let req = self.display_request(w.inner_size(), w.scale_factor());
+        self.last_request = Some(req);
+        self.generation += 1;
+        let sink = ProxySink { proxy: self.proxy.clone(), generation: self.generation };
+        self.session = Some(Session::start(self.cfg.clone(), req, Arc::new(sink)));
+    }
+
+    /// The session ended; either quit or schedule a fresh one.
+    fn session_ended(&mut self, el: &ActiveEventLoop, reason: String, retryable: bool) {
+        let delay = match self.reconnector.ended(retryable) {
+            OnEnd::Exit => return self.fail(el, reason),
+            OnEnd::Retry(d) => d,
+        };
+        tracing::warn!("{reason}; reconnecting in {} s", delay.as_secs());
+        // Joins the old threads so their sockets and UDP ports are released
+        // before the next session binds them.
+        if let Some(s) = self.session.take() {
+            s.shutdown();
+        }
+        self.retry_due = Some(Instant::now() + delay);
+        // Input state belongs to the dead session; the host forgets held
+        // keys and buttons with it.
+        self.pressed.clear();
+        self.buttons = 0;
+        self.scroll_accum = 0.0;
+        self.cursors.clear();
+        if let Some(w) = &self.window {
+            w.set_cursor_visible(true);
+            w.set_cursor(CursorIcon::Default);
+            w.set_title(&format!("{} — reconnecting…", self.opts.title));
+            w.request_redraw();
+        }
+        if let Some(r) = &mut self.renderer {
+            r.set_dimmed(true);
+        }
+    }
+
     fn fail(&mut self, el: &ActiveEventLoop, msg: String) {
         self.error = Some(msg);
         el.exit();
     }
 }
 
-impl ApplicationHandler<Event> for App {
+impl ApplicationHandler<Tagged> for App {
     fn resumed(&mut self, el: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -210,15 +268,23 @@ impl ApplicationHandler<Event> for App {
             Ok(r) => self.renderer = Some(r),
             Err(e) => return self.fail(el, format!("{e:#}")),
         }
-        let req = self.display_request(window.inner_size(), window.scale_factor());
-        self.last_request = Some(req);
         self.window = Some(window);
-        self.session = Some(Session::start(self.cfg.clone(), req, Arc::new(ProxySink(self.proxy.clone()))));
+        self.start_session();
     }
 
-    fn user_event(&mut self, el: &ActiveEventLoop, event: Event) {
+    fn user_event(&mut self, el: &ActiveEventLoop, Tagged { generation, event }: Tagged) {
+        if generation != self.generation {
+            return;
+        }
         match event {
             Event::Connected => {
+                if self.reconnector.reconnecting() {
+                    tracing::info!("reconnected");
+                }
+                self.reconnector.connected();
+                if let Some(r) = &mut self.renderer {
+                    r.set_dimmed(false);
+                }
                 if let Some(w) = &self.window {
                     w.set_title(&self.opts.title);
                 }
@@ -243,6 +309,7 @@ impl ApplicationHandler<Event> for App {
                 self.error = reason;
                 el.exit();
             }
+            Event::Lost(reason) => self.session_ended(el, reason, true),
         }
     }
 
@@ -317,11 +384,24 @@ impl ApplicationHandler<Event> for App {
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
-        match self.resize_due {
+        if let Some(due) = self.retry_due
+            && Instant::now() >= due {
+                self.retry_due = None;
+                tracing::info!("reconnecting");
+                self.start_session();
+            }
+        let wake = match (self.resize_due, self.retry_due) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        match wake {
             Some(due) if Instant::now() >= due => {
                 self.resize_due = None;
                 self.send_resize();
-                el.set_control_flow(ControlFlow::Wait);
+                el.set_control_flow(match self.retry_due {
+                    Some(d) => ControlFlow::WaitUntil(d),
+                    None => ControlFlow::Wait,
+                });
             }
             Some(due) => el.set_control_flow(ControlFlow::WaitUntil(due)),
             None => el.set_control_flow(ControlFlow::Wait),
@@ -335,12 +415,13 @@ impl ApplicationHandler<Event> for App {
     }
 }
 
-/// Runs the viewer until the window closes or the session ends.
+/// Runs the viewer until the window closes or the session ends for good.
 pub fn run(cfg: Config, opts: Options) -> Result<()> {
-    let event_loop = EventLoop::<Event>::with_user_event().build()?;
+    let event_loop = EventLoop::<Tagged>::with_user_event().build()?;
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle_from_env(Box::new(
         event_loop.owned_display_handle(),
     )));
+    let reconnect = opts.reconnect;
     let mut app = App {
         cfg,
         opts,
@@ -349,6 +430,9 @@ pub fn run(cfg: Config, opts: Options) -> Result<()> {
         window: None,
         renderer: None,
         session: None,
+        generation: 0,
+        reconnector: Reconnector::new(reconnect),
+        retry_due: None,
         error: None,
         last_request: None,
         resize_due: None,

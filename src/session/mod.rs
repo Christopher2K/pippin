@@ -27,6 +27,7 @@ use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender};
 use parking_lot::Mutex;
 
+use crate::proto::auth::AuthError;
 use crate::proto::handshake::{self, ConnectParams, SessionMode};
 use crate::proto::messages::{self, DisplayRequest};
 use crate::proto::offers::MediaOffer;
@@ -34,6 +35,10 @@ use crate::proto::record::RecordSealer;
 use crate::video::decoder::Picture;
 
 pub use media::Feedback;
+
+/// How long sent control data may go unacknowledged before the connection
+/// counts as dead.
+const CONTROL_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Connection settings.
 #[derive(Clone)]
@@ -72,7 +77,12 @@ pub enum Event {
     /// Size of the encoded canvas in pixels.
     Canvas { width: u32, height: u32 },
     Cursor(CursorShape),
+    /// The session ended for good: bad credentials, a broken decoder, or a
+    /// failure while first connecting.
     Closed(Option<String>),
+    /// The connection failed or dropped in a way a fresh session may fix
+    /// (host asleep, network change, timeout).
+    Lost(String),
 }
 
 pub trait EventSink: Send + Sync + 'static {
@@ -209,8 +219,11 @@ impl Session {
             .spawn(move || {
                 let result = run(cfg, display, shared.clone(), &threads);
                 if !shared.stopped() {
-                    let reason = result.err().map(|e| format!("{e:#}"));
-                    shared.sink.emit(Event::Closed(reason.or_else(|| Some("connection closed".into()))));
+                    shared.sink.emit(match result {
+                        Err(e) if is_auth_rejection(&e) => Event::Closed(Some(format!("{e:#}"))),
+                        Err(e) => Event::Lost(format!("{e:#}")),
+                        Ok(()) => Event::Lost("connection closed".into()),
+                    });
                 }
                 shared.stop.store(true, Ordering::Release);
             })
@@ -254,22 +267,28 @@ impl Session {
         }
     }
 
+    /// Stops every session thread and waits for them, so the sockets are
+    /// closed and the UDP ports free once this returns. Also needed after
+    /// the session stopped itself, before a new one binds the same ports.
     pub fn shutdown(&self) {
-        if self.shared.stop.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        if let Some(c) = self.control() {
+        if !self.shared.stop.swap(true, Ordering::AcqRel)
+            && let Some(c) = self.control() {
             // Reset rather than close so the host tears the session down
             // immediately instead of waiting out its own timeouts.
             let w = c.writer.lock();
             let _ = socket2::SockRef::from(&w.0).set_linger(Some(Duration::ZERO));
             let _ = w.0.shutdown(std::net::Shutdown::Both);
-        }
+            }
         let threads: Vec<_> = self.threads.lock().drain(..).collect();
         for t in threads {
             let _ = t.join();
         }
     }
+}
+
+/// Wrong credentials won't get better by retrying.
+fn is_auth_rejection(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| matches!(c.downcast_ref::<AuthError>(), Some(AuthError::Rejected(_))))
 }
 
 fn bind_udp(port: u16) -> Result<UdpSocket> {
@@ -344,6 +363,10 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
         }
         shared.set_canvas(c.width, c.height);
     }
+    // We write to the host every tick (cursor poll), so a host that went to
+    // sleep or a vanished network shows up as unacknowledged data; give up
+    // after this long instead of the kernel's ~15 minutes of retransmits.
+    let _ = socket2::SockRef::from(&neg.stream).set_tcp_user_timeout(Some(CONTROL_ACK_TIMEOUT));
     let mut reader = neg.stream.try_clone()?;
     reader.set_read_timeout(None)?;
     let control = Arc::new(Control {

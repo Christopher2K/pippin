@@ -60,6 +60,9 @@ struct Cli {
     /// Skip the preliminary connection that wakes the host's daemon.
     #[arg(long)]
     no_warmup: bool,
+    /// Exit when the connection drops instead of reconnecting.
+    #[arg(long)]
+    no_reconnect: bool,
     /// More logging; repeat for debug output.
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
@@ -127,6 +130,7 @@ fn main() -> Result<()> {
         scale: cli.scale,
         auto_resize: !cli.no_auto_resize,
         swap_ctrl_cmd: cli.swap_ctrl_cmd,
+        reconnect: !cli.no_reconnect,
     };
     ui::run(cfg, opts)
 }
