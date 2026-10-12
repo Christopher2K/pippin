@@ -36,6 +36,11 @@ use crate::video::decoder::Picture;
 
 pub use media::Feedback;
 
+use crate::errors::Failure;
+
+/// How long to wait for the first video packet before giving up.
+const FIRST_VIDEO_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Connection settings.
 #[derive(Clone)]
 pub struct Config {
@@ -213,9 +218,13 @@ impl Session {
         let main = thread::Builder::new()
             .name("control".into())
             .spawn(move || {
+                let host = cfg.host;
                 let result = run(cfg, display, shared.clone(), &threads);
                 if !shared.stopped() {
-                    let reason = result.err().map(|e| format!("{e:#}"));
+                    let reason = result.err().map(|e| {
+                        tracing::debug!("session ended: {e:?}");
+                        crate::errors::classify(&e, host).to_string()
+                    });
                     shared.sink.emit(Event::Closed(reason.or_else(|| Some("connection closed".into()))));
                 }
                 shared.stop.store(true, Ordering::Release);
@@ -403,12 +412,32 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
     control.send(&crate::proto::clipboard::enable_auto_pasteboard());
     control.send(&crate::proto::clipboard::request_pasteboard());
     shared.sink.emit(Event::Connected);
+    {
+        let (shared, host, answered) = (shared.clone(), cfg.host, neg.canvas.is_some());
+        spawn(threads, "video-watchdog", move || video_watchdog(shared, host, answered));
+    }
 
     let mut rx = control::ControlReader::new(shared.clone(), control, clip_tx, fb_tx);
     for msg in neg.pending {
         rx.dispatch(&msg);
     }
     rx.run(&mut reader, neg.opener)
+}
+
+/// Ends the session with an explanation if no video packet arrives soon
+/// after connecting. Leaves `stop` to the UI so its shutdown still runs.
+fn video_watchdog(shared: Arc<Shared>, host: Ipv4Addr, answered: bool) {
+    let deadline = Instant::now() + FIRST_VIDEO_TIMEOUT;
+    while Instant::now() < deadline {
+        if shared.stopped() || shared.last_video_packet.load(Ordering::Relaxed) != 0 {
+            return;
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    let failure = if answered { Failure::NoVideo } else { Failure::NoMediaAnswer };
+    tracing::debug!("{failure} after {FIRST_VIDEO_TIMEOUT:?} (media answer: {answered})");
+    let msg = crate::errors::classify(&failure.into(), host).to_string();
+    shared.sink.emit(Event::Closed(Some(msg)));
 }
 
 impl Shared {
