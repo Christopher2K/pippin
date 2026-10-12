@@ -67,8 +67,9 @@ struct Cli {
     scale: Option<f64>,
     /// Fraction of the window's pixels the Mac renders and streams; the
     /// picture is scaled up locally. 0.5 on a Retina screen streams a quarter
-    /// of the pixels (much cheaper to decode, softer text). The Mac's layout
-    /// is unchanged.
+    /// of the pixels: less bandwidth and smaller keyframes for slow links, at
+    /// the cost of softer text. The Mac's layout is unchanged. macOS only
+    /// renders whole scales, so 0.5 needs a Retina (2x) window.
     #[arg(long, default_value_t = 1.0)]
     render_scale: f64,
     /// Keep the remote resolution fixed instead of following the window.
@@ -163,8 +164,8 @@ fn run() -> Result<()> {
         && !(1.0..=3.0).contains(&s) {
             bail!("--scale must be between 1 and 3");
         }
-    if !(0.25..=1.0).contains(&cli.render_scale) {
-        bail!("--render-scale must be between 0.25 and 1");
+    if cli.render_scale != 1.0 && cli.render_scale != 0.5 {
+        bail!("--render-scale must be 1 or 0.5 (macOS only renders at whole scales)");
     }
     let store: Arc<dyn credentials::Store> = Arc::new(credentials::Keyring);
     if cli.forget_password {
