@@ -16,7 +16,7 @@ use winit::window::{Window, WindowId};
 use super::Tagged;
 
 /// What the dialog edits; also what it returns on Connect.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct Fields {
     pub host: String,
     pub user: String,
@@ -25,9 +25,33 @@ pub struct Fields {
     pub save: bool,
 }
 
+// By hand so the password never reaches a log line.
+impl std::fmt::Debug for Fields {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Fields")
+            .field("host", &self.host)
+            .field("user", &self.user)
+            .field("password", &if self.password.is_empty() { "" } else { "<redacted>" })
+            .field("save", &self.save)
+            .finish()
+    }
+}
+
 impl Fields {
     fn complete(&self) -> bool {
         !self.host.trim().is_empty() && !self.user.trim().is_empty() && !self.password.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_hides_password() {
+        let f = Fields { host: "mac".into(), user: "alice".into(), password: "hunter2".into(), save: false };
+        let s = format!("{f:?}");
+        assert!(!s.contains("hunter2") && s.contains("alice"), "{s}");
     }
 }
 
@@ -82,7 +106,8 @@ impl Dialog {
             .find(|f| {
                 matches!(f.remove_srgb_suffix(), wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm)
             })
-            .unwrap_or(caps.formats[0]);
+            .or_else(|| caps.formats.first().copied())
+            .context("the dialog surface supports no formats")?;
         // egui blends in gamma space and wants a non-sRGB target.
         let view_format = format.remove_srgb_suffix();
         let config = wgpu::SurfaceConfiguration {
@@ -92,7 +117,7 @@ impl Dialog {
             height: size.height.max(1),
             present_mode: wgpu::PresentMode::Fifo,
             desired_maximum_frame_latency: 2,
-            alpha_mode: caps.alpha_modes[0],
+            alpha_mode: *caps.alpha_modes.first().context("the dialog surface supports no alpha modes")?,
             color_space: wgpu::SurfaceColorSpace::Auto,
             view_formats: if view_format != format { vec![view_format] } else { vec![] },
         };
