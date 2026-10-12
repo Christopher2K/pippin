@@ -411,8 +411,12 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
     if let Some(hook) = &cfg.on_auth {
         match &negotiated {
             Ok(_) => hook(true),
-            Err(e) if matches!(e.downcast_ref::<AuthError>(), Some(AuthError::Rejected(_))) => hook(false),
-            Err(_) => {}
+            Err(e) => {
+                if let Some(AuthError::Rejected(code)) = e.downcast_ref::<AuthError>() {
+                    tracing::info!("host rejected the credentials (code {code})");
+                    hook(false);
+                }
+            }
         }
     }
     *shared.connecting.lock() = None;

@@ -152,7 +152,7 @@ fn run() -> Result<()> {
         match store.delete(&account) {
             Ok(true) => println!("removed stored password for {account}"),
             Ok(false) => println!("no stored password for {account}"),
-            Err(e) => tracing::warn!("keyring unavailable: {e:#}"),
+            Err(e) => return Err(e.context("keyring unavailable")),
         }
         return Ok(());
     }
