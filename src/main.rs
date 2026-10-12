@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 macshare contributors. Protocol knowledge derived from
+// iShareScreen (https://github.com/renegadelink/iShareScreen), AGPL-3.0-or-later.
+
 //! macshare: a native client for macOS Screen Sharing's high-performance
 //! (HEVC) mode.
 

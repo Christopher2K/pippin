@@ -2,6 +2,9 @@
 name = "macshare"
 version = "0.1.0"
 edition = "2024"
+license = "AGPL-3.0-or-later"
+description = "Native client for macOS high-performance Screen Sharing"
+repository = "https://github.com/jonesy827/macshare"
 
 [dependencies]
 aes = "0.8"
