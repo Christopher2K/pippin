@@ -38,6 +38,8 @@ const SCROLL_MAX_CLICKS_PER_EVENT: f64 = 200.0;
 
 pub struct Options {
     pub title: String,
+    /// The host as the user named it, for messages.
+    pub host_name: String,
     /// Initial window size in logical pixels.
     pub size: (u32, u32),
     /// Backing scale to request; `None` follows the window's scale factor.
@@ -227,6 +229,10 @@ impl App {
     fn session_ended(&mut self, el: &ActiveEventLoop, reason: String, retryable: bool) {
         let delay = match self.reconnector.ended(retryable) {
             OnEnd::Exit => return self.fail(el, reason),
+            OnEnd::GiveUp => {
+                let host = &self.opts.host_name;
+                return self.fail(el, format!("Gave up reconnecting to {host} after 10 minutes without video ({reason})"));
+            }
             OnEnd::Retry(d) => d,
         };
         tracing::warn!("{reason}; reconnecting in {} s", delay.as_secs());

@@ -1,10 +1,12 @@
 //! When to bring a dropped session back: what a session end means for the
 //! window, and how long to wait between attempts.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const FIRST_DELAY: Duration = Duration::from_secs(1);
 const MAX_DELAY: Duration = Duration::from_secs(30);
+/// Stop reconnecting once this long has passed without any video.
+const GIVE_UP_AFTER: Duration = Duration::from_secs(10 * 60);
 
 /// Doubling delay between reconnect attempts, capped at [`MAX_DELAY`].
 #[derive(Debug)]
@@ -37,6 +39,8 @@ impl Backoff {
 pub enum OnEnd {
     Exit,
     Retry(Duration),
+    /// Reconnecting has gone on too long without a picture.
+    GiveUp,
 }
 
 /// Session lifecycle as the window sees it.
@@ -48,6 +52,9 @@ pub struct Reconnector {
     connected_once: bool,
     reconnecting: bool,
     backoff: Backoff,
+    /// Last sign the host really works: the latest picture, or the first
+    /// connect if none has arrived yet.
+    alive_at: Option<Instant>,
 }
 
 impl Reconnector {
@@ -64,20 +71,33 @@ impl Reconnector {
     /// backoff keeps growing until [`Self::video`].
     pub fn connected(&mut self) {
         self.connected_once = true;
+        self.alive_at.get_or_insert_with(Instant::now);
         self.reconnecting = false;
     }
 
     /// A picture arrived: the session really works, so the next drop
     /// starts again from the first delay.
     pub fn video(&mut self) {
+        self.video_at(Instant::now());
+    }
+
+    fn video_at(&mut self, now: Instant) {
+        self.alive_at = Some(now);
         self.backoff.reset();
     }
 
     /// The session ended; `retryable` is false for failures another attempt
     /// can't fix, such as rejected credentials.
     pub fn ended(&mut self, retryable: bool) -> OnEnd {
+        self.ended_at(retryable, Instant::now())
+    }
+
+    fn ended_at(&mut self, retryable: bool, now: Instant) -> OnEnd {
         if !(self.enabled && self.connected_once && retryable) {
             return OnEnd::Exit;
+        }
+        if self.alive_at.is_some_and(|t| now.duration_since(t) >= GIVE_UP_AFTER) {
+            return OnEnd::GiveUp;
         }
         self.reconnecting = true;
         OnEnd::Retry(self.backoff.next_delay())
@@ -145,6 +165,20 @@ mod tests {
         r.connected();
         assert_eq!(r.ended(true), secs(1));
         assert_eq!(r.ended(false), OnEnd::Exit);
+    }
+
+    #[test]
+    fn gives_up_after_ten_minutes_without_video() {
+        let mut r = Reconnector::new(true);
+        r.connected();
+        let t0 = Instant::now();
+        r.video_at(t0);
+        assert_eq!(r.ended_at(true, t0 + Duration::from_secs(5)), secs(1));
+        assert_eq!(r.ended_at(true, t0 + GIVE_UP_AFTER - Duration::from_secs(1)), secs(2));
+        assert_eq!(r.ended_at(true, t0 + GIVE_UP_AFTER), OnEnd::GiveUp);
+        // A picture in between restarts the clock.
+        r.video_at(t0 + GIVE_UP_AFTER);
+        assert_eq!(r.ended_at(true, t0 + GIVE_UP_AFTER + Duration::from_secs(60)), secs(1));
     }
 
     #[test]

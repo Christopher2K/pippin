@@ -274,6 +274,7 @@ fn connect(
     };
     let opts = ui::Options {
         title: format!("{host_name} — macshare"),
+        host_name: host_name.to_owned(),
         size: cli.size,
         scale: cli.scale,
         auto_resize: !cli.no_auto_resize,
