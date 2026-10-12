@@ -373,6 +373,9 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
         && let Err(e) = handshake::warmup(addr) {
             tracing::warn!("warmup connection failed: {e:#}");
         }
+    if shared.stopped() {
+        return Ok(());
+    }
 
     // Keep the local firewall's return path open for the host's media while
     // negotiating; the host may start streaming at any point.
@@ -403,6 +406,10 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
                     let _ = s.shutdown(std::net::Shutdown::Both);
                 }
             }
+        })),
+        stopped: Some(Box::new({
+            let shared = shared.clone();
+            move || shared.stopped()
         })),
     };
     let negotiated = handshake::connect(&params);

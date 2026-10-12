@@ -41,7 +41,14 @@ pub struct ConnectParams {
     /// Shown each control connection as soon as it's open, so the caller
     /// can shut it down to abort a handshake stuck waiting on the host.
     pub on_open: Option<Box<dyn Fn(&TcpStream) + Send + Sync>>,
+    /// Polled before each new connection; true abandons the handshake.
+    pub stopped: Option<Box<dyn Fn() -> bool + Send + Sync>>,
 }
+
+/// The handshake was abandoned because the caller stopped the session.
+#[derive(Debug, thiserror::Error)]
+#[error("connect cancelled")]
+pub struct Cancelled;
 
 /// An authenticated, encrypted control connection with media negotiated.
 pub struct Negotiated {
@@ -85,6 +92,9 @@ fn banner(s: &mut TcpStream) -> Result<Vec<u8>> {
 }
 
 fn open(p: &ConnectParams) -> Result<TcpStream> {
+    if p.stopped.as_ref().is_some_and(|f| f()) {
+        return Err(Cancelled.into());
+    }
     let addr = p.addr;
     let mut s = TcpStream::connect_timeout(&addr.into(), IO_TIMEOUT)
         .with_context(|| format!("connecting to {addr}"))?;
