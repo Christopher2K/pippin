@@ -20,7 +20,7 @@ const MAX_CACHED_CURSORS: usize = 64;
 pub(super) struct ControlReader {
     shared: Arc<Shared>,
     control: Arc<Control>,
-    clipboard_out: Sender<String>,
+    clipboard_out: Sender<clipboard::Content>,
     feedback: Sender<Feedback>,
     clipboard: Reassembler,
     cursors: HashMap<u32, CursorShape>,
@@ -53,7 +53,7 @@ impl ControlReader {
     pub fn new(
         shared: Arc<Shared>,
         control: Arc<Control>,
-        clipboard_out: Sender<String>,
+        clipboard_out: Sender<clipboard::Content>,
         feedback: Sender<Feedback>,
     ) -> Self {
         Self {
@@ -88,9 +88,14 @@ impl ControlReader {
         // Continuation records of a multi-record 0x1f carry no type byte.
         if self.clipboard.in_progress() || msg[0] == 0x1f {
             if let Some(full) = self.clipboard.feed(msg)
-                && let Some(text) = clipboard::text_from_message(&full) {
-                    tracing::debug!("remote clipboard: {} chars", text.chars().count());
-                    let _ = self.clipboard_out.send(text);
+                && let Some(content) = clipboard::content_from_message(&full) {
+                    match &content {
+                        clipboard::Content::Text(t) => tracing::debug!("remote clipboard: {} chars", t.chars().count()),
+                        clipboard::Content::Image { tiff, data } => {
+                            tracing::debug!("remote clipboard: {} image, {} bytes", if *tiff { "tiff" } else { "png" }, data.len())
+                        }
+                    }
+                    let _ = self.clipboard_out.send(content);
                 }
             return;
         }

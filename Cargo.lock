@@ -1223,6 +1223,7 @@ dependencies = [
  "ctr",
  "flate2",
  "hmac",
+ "image",
  "libc",
  "num-bigint",
  "num-traits",
@@ -1243,6 +1244,7 @@ dependencies = [
  "uuid",
  "wgpu",
  "winit",
+ "wl-clipboard-rs",
 ]
 
 [[package]]

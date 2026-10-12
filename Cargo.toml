@@ -10,6 +10,7 @@ repository = "https://github.com/jonesy827/macshare"
 aes = "0.8"
 anyhow = "1.0.104"
 arboard = { version = "3.6.1", features = ["wayland-data-control"] }
+image = { version = "0.25", default-features = false, features = ["png", "tiff"] }
 bytemuck = { version = "1.25.2", features = ["derive"] }
 cbc = "0.1"
 cipher = "0.4"
@@ -35,6 +36,7 @@ thiserror = "2.0.21"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1.28.0", features = ["v4"] }
+wl-clipboard-rs = "0.9.4"
 wgpu = "30.0.1"
 winit = "0.30"
 

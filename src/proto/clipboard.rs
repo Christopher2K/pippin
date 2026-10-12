@@ -16,6 +16,8 @@ use super::wire::{Cursor, be32};
 
 const HEADER_LEN: usize = 16;
 const UTF8_TEXT: &str = "public.utf8-plain-text";
+const PNG: &str = "public.png";
+const TIFF: &str = "public.tiff";
 /// Refuse to inflate pasteboards beyond this size.
 const MAX_INFLATED: u64 = 64 << 20;
 
@@ -29,15 +31,26 @@ pub fn request_pasteboard() -> Vec<u8> {
 
 /// Builds an outbound 0x1f carrying `text` as `public.utf8-plain-text`.
 pub fn send_text(text: &str) -> Vec<u8> {
-    let data = text.as_bytes();
-    let mut inner = Vec::with_capacity(data.len() + 48);
-    inner.extend_from_slice(&1u32.to_be_bytes());
-    inner.extend_from_slice(&(UTF8_TEXT.len() as u32).to_be_bytes());
-    inner.extend_from_slice(UTF8_TEXT.as_bytes());
-    inner.extend_from_slice(&0u32.to_be_bytes()); // reserved
-    inner.extend_from_slice(&0u32.to_be_bytes()); // alias count
-    inner.extend_from_slice(&(data.len() as u32).to_be_bytes());
-    inner.extend_from_slice(data);
+    send_items(&[(UTF8_TEXT, text.as_bytes())])
+}
+
+/// Builds an outbound 0x1f carrying a PNG image as `public.png`.
+pub fn send_png(png: &[u8]) -> Vec<u8> {
+    send_items(&[(PNG, png)])
+}
+
+fn send_items(items: &[(&str, &[u8])]) -> Vec<u8> {
+    let size: usize = items.iter().map(|(u, d)| u.len() + d.len() + 16).sum();
+    let mut inner = Vec::with_capacity(size + 4);
+    inner.extend_from_slice(&(items.len() as u32).to_be_bytes());
+    for (uti, data) in items {
+        inner.extend_from_slice(&(uti.len() as u32).to_be_bytes());
+        inner.extend_from_slice(uti.as_bytes());
+        inner.extend_from_slice(&0u32.to_be_bytes()); // reserved
+        inner.extend_from_slice(&0u32.to_be_bytes()); // alias count
+        inner.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        inner.extend_from_slice(data);
+    }
 
     let mut z = ZlibEncoder::new(Vec::new(), Compression::default());
     z.write_all(&inner).expect("in-memory zlib");
@@ -121,8 +134,17 @@ fn decode_utf16(data: &[u8], big_endian: bool) -> String {
     String::from_utf16_lossy(&units)
 }
 
-/// Decodes a complete 0x1f message and returns its best text flavor.
-pub fn text_from_message(full: &[u8]) -> Option<String> {
+/// The most useful flavor of a host pasteboard.
+#[derive(Debug, PartialEq)]
+pub enum Content {
+    Text(String),
+    /// Encoded image bytes, still in the host's format.
+    Image { tiff: bool, data: Vec<u8> },
+}
+
+/// Decodes a complete 0x1f message. Text wins over images, since rich text
+/// copies often carry a rendered picture alongside.
+pub fn content_from_message(full: &[u8]) -> Option<Content> {
     if full.len() < HEADER_LEN {
         return None;
     }
@@ -136,7 +158,32 @@ pub fn text_from_message(full: &[u8]) -> Option<String> {
             tracing::warn!("clipboard inflate failed: {e}");
             return None;
         }
-    let items = parse_items(&raw)?;
+    let mut items = parse_items(&raw)?;
+    if let Some(text) = text_from_items(&items) {
+        return Some(Content::Text(text));
+    }
+    for (uti, tiff) in [(PNG, false), (TIFF, true)] {
+        if let Some(i) = items.iter().position(|i| i.uti == uti) {
+            return Some(Content::Image { tiff, data: items.swap_remove(i).data });
+        }
+    }
+    tracing::debug!(
+        utis = ?items.iter().map(|i| i.uti.as_str()).collect::<Vec<_>>(),
+        "pasteboard has no text or image flavor"
+    );
+    None
+}
+
+/// Decodes a complete 0x1f message and returns its best text flavor.
+#[cfg(test)]
+pub fn text_from_message(full: &[u8]) -> Option<String> {
+    match content_from_message(full)? {
+        Content::Text(t) => Some(t),
+        Content::Image { .. } => None,
+    }
+}
+
+fn text_from_items(items: &[Item]) -> Option<String> {
     if let Some(it) = items.iter().find(|i| i.uti == UTF8_TEXT) {
         return Some(String::from_utf8_lossy(&it.data).into_owned());
     }
@@ -149,10 +196,6 @@ pub fn text_from_message(full: &[u8]) -> Option<String> {
     if let Some(it) = items.iter().find(|i| i.uti == "com.apple.traditional-mac-plain-text") {
         return Some(it.data.iter().map(|&b| b as char).collect());
     }
-    tracing::debug!(
-        utis = ?items.iter().map(|i| i.uti.as_str()).collect::<Vec<_>>(),
-        "pasteboard has no text flavor"
-    );
     None
 }
 
@@ -173,6 +216,21 @@ mod tests {
         let full = out.expect("complete");
         assert!(!r.in_progress());
         assert_eq!(text_from_message(&full).as_deref(), Some(text.as_str()));
+    }
+
+    #[test]
+    fn png_round_trip() {
+        let png = vec![0x89, b'P', b'N', b'G', 1, 2, 3];
+        let got = content_from_message(&send_png(&png));
+        assert_eq!(got, Some(Content::Image { tiff: false, data: png }));
+    }
+
+    #[test]
+    fn text_beats_image() {
+        let msg = send_items(&[(TIFF, b"II*\0"), (UTF8_TEXT, b"hi")]);
+        assert_eq!(content_from_message(&msg), Some(Content::Text("hi".into())));
+        let msg = send_items(&[(TIFF, b"II*\0"), ("com.example.other", b"x")]);
+        assert_eq!(content_from_message(&msg), Some(Content::Image { tiff: true, data: b"II*\0".to_vec() }));
     }
 
     #[test]
