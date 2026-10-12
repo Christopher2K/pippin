@@ -60,6 +60,8 @@ pub struct Config {
     pub hardware_decode: bool,
     /// Software decoder threads; see `DecoderOptions`.
     pub decode_threads: u32,
+    /// Present a host frame's tiles together (see `--sync-tiles`).
+    pub sync_tiles: bool,
     pub warmup: bool,
     /// Told whether the host accepted the password; not called when the
     /// connection fails for another reason.
@@ -529,7 +531,8 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
             prefer_hw: cfg.hardware_decode,
             threads: cfg.decode_threads,
         };
-        spawn(threads, "decoder", move || media::decoder(shared, dec_rx, fb, opts));
+        let sync = cfg.sync_tiles;
+        spawn(threads, "decoder", move || media::decoder(shared, dec_rx, fb, opts, sync));
     }
     {
         let (shared, sock) = (shared.clone(), ctrl_sock.try_clone()?);

@@ -78,6 +78,10 @@ struct Cli {
     /// so more threads add no latency; gains level off around 4-5.
     #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u32).range(1..=16))]
     decode_threads: u32,
+    /// Show each frame's tiles together. Prevents horizontal tearing while
+    /// windows move, but holds early tiles until the last one is decoded.
+    #[arg(long)]
+    sync_tiles: bool,
     /// Skip the preliminary connection that wakes the host's daemon.
     #[arg(long)]
     no_warmup: bool,
@@ -297,6 +301,7 @@ fn connect(
         session_mode: cli.session,
         hardware_decode: !cli.no_hw,
         decode_threads: cli.decode_threads,
+        sync_tiles: cli.sync_tiles,
         warmup: !cli.no_warmup,
         on_auth: Some(on_auth),
         resumed: false,

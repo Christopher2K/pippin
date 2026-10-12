@@ -255,6 +255,8 @@ struct DecodeLoop {
     fed_without_output: Option<u32>,
     /// Decoded pictures of the frame being gathered, and when it started.
     batch: Vec<(usize, Picture)>,
+    /// Gather tiles into frames; otherwise each picture is shown at once.
+    sync_tiles: bool,
     batch_started: Option<Instant>,
     last_input: Instant,
     gather: GatherStats,
@@ -465,7 +467,7 @@ impl DecodeLoop {
         }
         self.batch_started.get_or_insert_with(Instant::now);
         self.batch.push((tile, pic));
-        if self.batch.len() >= self.shared.tiles.load(Ordering::Relaxed) as usize {
+        if !self.sync_tiles || self.batch.len() >= self.shared.tiles.load(Ordering::Relaxed) as usize {
             self.flush(Flush::Complete);
         }
     }
@@ -495,7 +497,7 @@ impl DecodeLoop {
     }
 }
 
-pub(super) fn decoder(shared: Arc<Shared>, rx: Receiver<DecoderMsg>, fb: Sender<Feedback>, opts: DecoderOptions) {
+pub(super) fn decoder(shared: Arc<Shared>, rx: Receiver<DecoderMsg>, fb: Sender<Feedback>, opts: DecoderOptions, sync_tiles: bool) {
     let decoder = match Decoder::new(opts) {
         Ok(d) => d,
         Err(e) => {
@@ -517,6 +519,7 @@ pub(super) fn decoder(shared: Arc<Shared>, rx: Receiver<DecoderMsg>, fb: Sender<
         origin: HashMap::new(),
         fed_without_output: cuda.then_some(0),
         batch: Vec::new(),
+        sync_tiles,
         batch_started: None,
         last_input: Instant::now(),
         gather: GatherStats::new(),
