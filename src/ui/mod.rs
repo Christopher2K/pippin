@@ -219,7 +219,8 @@ impl App {
         // the shared event loop can't match a new session.
         self.generation = NEXT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let sink = ProxySink { proxy: self.proxy.clone(), generation: self.generation };
-        self.session = Some(Session::start(self.cfg.clone(), req, Arc::new(sink)));
+        let cfg = Config { resumed: self.reconnector.reconnecting(), ..self.cfg.clone() };
+        self.session = Some(Session::start(cfg, req, Arc::new(sink)));
     }
 
     /// The session ended; either quit or schedule a fresh one.

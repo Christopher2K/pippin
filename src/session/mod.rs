@@ -60,6 +60,10 @@ pub struct Config {
     /// Told whether the host accepted the password; not called when the
     /// connection fails for another reason.
     pub on_auth: Option<AuthHook>,
+    /// This session replaces one that dropped. Missing video then is more
+    /// likely a host still waking up than a firewall, so it's retried
+    /// rather than reported as fatal.
+    pub resumed: bool,
 }
 
 pub type AuthHook = Arc<dyn Fn(bool) + Send + Sync>;
@@ -429,8 +433,8 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
     control.send(&crate::proto::clipboard::request_pasteboard());
     shared.sink.emit(Event::Connected);
     {
-        let (shared, host, answered) = (shared.clone(), cfg.host, neg.canvas.is_some());
-        spawn(threads, "video-watchdog", move || video_watchdog(shared, host, answered));
+        let (shared, host, answered, resumed) = (shared.clone(), cfg.host, neg.canvas.is_some(), cfg.resumed);
+        spawn(threads, "video-watchdog", move || video_watchdog(shared, host, answered, resumed));
     }
 
     let mut rx = control::ControlReader::new(shared.clone(), control, clip_tx, fb_tx);
@@ -442,7 +446,7 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
 
 /// Ends the session with an explanation if no video packet arrives soon
 /// after connecting. Leaves `stop` to the UI so its shutdown still runs.
-fn video_watchdog(shared: Arc<Shared>, host: Ipv4Addr, answered: bool) {
+fn video_watchdog(shared: Arc<Shared>, host: Ipv4Addr, answered: bool, resumed: bool) {
     let deadline = Instant::now() + FIRST_VIDEO_TIMEOUT;
     while Instant::now() < deadline {
         if shared.stopped() || shared.last_video_packet.load(Ordering::Relaxed) != 0 {
@@ -453,7 +457,7 @@ fn video_watchdog(shared: Arc<Shared>, host: Ipv4Addr, answered: bool) {
     let failure = if answered { Failure::NoVideo } else { Failure::NoMediaAnswer };
     tracing::debug!("{failure} after {FIRST_VIDEO_TIMEOUT:?} (media answer: {answered})");
     let msg = crate::errors::classify(&failure.into(), host).to_string();
-    shared.sink.emit(Event::Closed(Some(msg)));
+    shared.sink.emit(if resumed { Event::Lost(msg) } else { Event::Closed(Some(msg)) });
 }
 
 impl Shared {

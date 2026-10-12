@@ -278,6 +278,7 @@ fn connect(
         decode_threads: cli.decode_threads,
         warmup: !cli.no_warmup,
         on_auth: Some(on_auth),
+        resumed: false,
     };
     let opts = ui::Options {
         title: format!("{host_name} — macshare"),
