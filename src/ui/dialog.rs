@@ -13,7 +13,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::platform::run_on_demand::EventLoopExtRunOnDemand;
 use winit::window::{Window, WindowId};
 
-use crate::session::Event;
+use super::Tagged;
 
 /// What the dialog edits; also what it returns on Connect.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -229,7 +229,7 @@ impl Dialog {
     }
 }
 
-impl ApplicationHandler<Event> for Dialog {
+impl ApplicationHandler<Tagged> for Dialog {
     fn resumed(&mut self, el: &ActiveEventLoop) {
         if self.gpu.is_some() {
             return;
@@ -246,7 +246,7 @@ impl ApplicationHandler<Event> for Dialog {
         }
     }
 
-    fn user_event(&mut self, _el: &ActiveEventLoop, _event: Event) {}
+    fn user_event(&mut self, _el: &ActiveEventLoop, _event: Tagged) {}
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let Some(gpu) = &mut self.gpu else { return };
@@ -285,7 +285,7 @@ impl ApplicationHandler<Event> for Dialog {
 /// Shows the dialog until Connect (returns the fields) or Cancel / close
 /// (returns `None`). `error` is shown under the fields, e.g. after the host
 /// rejected the previous attempt.
-pub fn run(el: &mut EventLoop<Event>, fields: Fields, error: Option<String>) -> Result<Option<Fields>> {
+pub fn run(el: &mut EventLoop<Tagged>, fields: Fields, error: Option<String>) -> Result<Option<Fields>> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle_from_env(Box::new(
         el.owned_display_handle(),
     )));

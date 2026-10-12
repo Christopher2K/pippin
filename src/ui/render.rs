@@ -30,8 +30,7 @@ fn vs(@builtin(vertex_index) i: u32) -> Out {
 }
 
 // BT.709, full range.
-@fragment
-fn fs(i: Out) -> @location(0) vec4<f32> {
+fn rgb_at(i: Out) -> vec4<f32> {
     let y = textureSample(y_tex, samp, i.uv).r;
     let cb = textureSample(u_tex, samp, i.uv).r - 0.5;
     let cr = textureSample(v_tex, samp, i.uv).r - 0.5;
@@ -41,6 +40,18 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
         y + 1.8556 * cb,
     );
     return vec4<f32>(clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+}
+
+@fragment
+fn fs(i: Out) -> @location(0) vec4<f32> {
+    return rgb_at(i);
+}
+
+// The last picture, dimmed while the session is reconnecting.
+@fragment
+fn fs_dim(i: Out) -> @location(0) vec4<f32> {
+    let c = rgb_at(i);
+    return vec4<f32>(c.rgb * 0.35, 1.0);
 }
 "#;
 
@@ -68,6 +79,8 @@ pub struct Renderer {
     config: wgpu::SurfaceConfiguration,
     view_format: wgpu::TextureFormat,
     pipeline: wgpu::RenderPipeline,
+    dim_pipeline: wgpu::RenderPipeline,
+    dimmed: bool,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     planes: Option<Planes>,
@@ -157,8 +170,8 @@ impl Renderer {
             bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("yuv"),
+        let make_pipeline = |fs| device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(fs),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
@@ -171,13 +184,15 @@ impl Renderer {
             multisample: wgpu::MultisampleState::default(),
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: Some("fs"),
+                entry_point: Some(fs),
                 compilation_options: Default::default(),
                 targets: &[Some(view_format.into())],
             }),
             multiview_mask: None,
             cache: None,
         });
+        let pipeline = make_pipeline("fs");
+        let dim_pipeline = make_pipeline("fs_dim");
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("planes"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -191,6 +206,8 @@ impl Renderer {
             config,
             view_format,
             pipeline,
+            dim_pipeline,
+            dimmed: false,
             layout,
             sampler,
             planes: None,
@@ -213,6 +230,11 @@ impl Renderer {
             // Recreated at the new size by the next picture.
             self.planes = None;
         }
+    }
+
+    /// Darkens the canvas, e.g. while the session is down.
+    pub fn set_dimmed(&mut self, dimmed: bool) {
+        self.dimmed = dimmed;
     }
 
     /// Size of the drawn image in stream pixels (the pointer coordinate space).
@@ -338,7 +360,7 @@ impl Renderer {
             if let (Some(p), Some(vp)) = (&self.planes, self.viewport())
                 && vp.w >= 1.0 && vp.h >= 1.0 {
                     pass.set_viewport(vp.x, vp.y, vp.w, vp.h, 0.0, 1.0);
-                    pass.set_pipeline(&self.pipeline);
+                    pass.set_pipeline(if self.dimmed { &self.dim_pipeline } else { &self.pipeline });
                     pass.set_bind_group(0, &p.bind_group, &[]);
                     pass.draw(0..3, 0..1);
                 }

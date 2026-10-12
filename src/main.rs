@@ -81,6 +81,9 @@ struct Cli {
     /// Skip the preliminary connection that wakes the host's daemon.
     #[arg(long)]
     no_warmup: bool,
+    /// Exit when the connection drops instead of reconnecting.
+    #[arg(long)]
+    no_reconnect: bool,
     /// More logging; repeat for debug output.
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
@@ -185,7 +188,7 @@ fn run() -> Result<()> {
 /// Shows the connect dialog until a session runs or the user cancels; a
 /// rejected password brings the dialog back with an error line.
 fn dialog_loop(
-    event_loop: &mut winit::event_loop::EventLoop<session::Event>,
+    event_loop: &mut winit::event_loop::EventLoop<ui::Tagged>,
     cli: &Cli,
     store: &Arc<dyn credentials::Store>,
 ) -> Result<()> {
@@ -221,7 +224,7 @@ enum Outcome {
 /// unresolvable host come back as `Retry` so the dialog can ask again.
 #[allow(clippy::too_many_arguments)]
 fn connect(
-    event_loop: &mut winit::event_loop::EventLoop<session::Event>,
+    event_loop: &mut winit::event_loop::EventLoop<ui::Tagged>,
     cli: &Cli,
     store: &Arc<dyn credentials::Store>,
     host_name: &str,
@@ -275,6 +278,7 @@ fn connect(
         scale: cli.scale,
         auto_resize: !cli.no_auto_resize,
         swap_ctrl_cmd: cli.swap_ctrl_cmd,
+        reconnect: !cli.no_reconnect,
     };
     let result = ui::run(event_loop, cfg, opts);
     if result.is_err() && from_dialog && rejected.load(Ordering::SeqCst) {
