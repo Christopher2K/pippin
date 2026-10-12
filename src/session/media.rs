@@ -257,6 +257,7 @@ struct DecodeLoop {
     batch: Vec<(usize, Picture)>,
     batch_started: Option<Instant>,
     last_input: Instant,
+    gather: GatherStats,
     stats: DecodeStats,
     /// MACSHARE_DUMP_HEVC: every access unit fed to the decoder, as Annex B,
     /// for offline analysis (ffmpeg -bsf:v trace_headers) and benchmarks.
@@ -280,6 +281,57 @@ fn open_dump() -> Option<std::io::BufWriter<std::fs::File>> {
 const STATS_EVERY: Duration = Duration::from_secs(5);
 
 /// Decoder throughput, logged at debug level so slow decoding is visible.
+/// Why a gathered frame was presented.
+#[derive(Debug, Clone, Copy)]
+enum Flush {
+    /// Every tile arrived.
+    Complete,
+    /// A tile came again before the others: the frame was partial.
+    Repeat,
+    /// Input went quiet: the rest of the tiles didn't change.
+    Idle,
+    /// Held as long as allowed under a steady stream.
+    MaxHold,
+}
+
+/// How tile pictures were grouped into presented frames, logged every
+/// STATS_EVERY at debug level.
+struct GatherStats {
+    since: Instant,
+    frames: u32,
+    tiles: u32,
+    by_reason: [u32; 4],
+    held: Duration,
+    worst: Duration,
+}
+
+impl GatherStats {
+    fn new() -> Self {
+        Self { since: Instant::now(), frames: 0, tiles: 0, by_reason: [0; 4], held: Duration::ZERO, worst: Duration::ZERO }
+    }
+
+    fn record(&mut self, why: Flush, tiles: usize, held: Duration) {
+        self.frames += 1;
+        self.tiles += tiles as u32;
+        self.by_reason[why as usize] += 1;
+        self.held += held;
+        self.worst = self.worst.max(held);
+        let elapsed = self.since.elapsed();
+        if elapsed >= STATS_EVERY {
+            let [complete, repeat, idle, max] = self.by_reason;
+            tracing::debug!(
+                "present: {:.1} frames/s, {:.2} tiles/frame, held avg {:.1} ms worst {:.1} ms; \
+                 complete {complete}, idle {idle}, repeat {repeat}, max-hold {max}",
+                self.frames as f64 / elapsed.as_secs_f64(),
+                self.tiles as f64 / self.frames as f64,
+                self.held.as_secs_f64() * 1000.0 / self.frames as f64,
+                self.worst.as_secs_f64() * 1000.0,
+            );
+            *self = Self::new();
+        }
+    }
+}
+
 struct DecodeStats {
     since: Instant,
     aus: u32,
@@ -409,18 +461,25 @@ impl DecodeLoop {
         self.shared.touch(&self.shared.last_frame);
         // A second picture for the same tile means a new frame has begun.
         if self.batch.iter().any(|(t, _)| *t == tile) {
-            self.flush();
+            self.flush(Flush::Repeat);
         }
         self.batch_started.get_or_insert_with(Instant::now);
         self.batch.push((tile, pic));
         if self.batch.len() >= self.shared.tiles.load(Ordering::Relaxed) as usize {
-            self.flush();
+            self.flush(Flush::Complete);
         }
     }
 
-    fn flush(&mut self) {
-        self.batch_started = None;
-        if !self.batch.is_empty() && self.shared.frames.put_frame(self.batch.drain(..)) {
+    fn flush(&mut self, why: Flush) {
+        let Some(started) = self.batch_started.take() else { return };
+        if self.batch.is_empty() {
+            return;
+        }
+        let held = started.elapsed();
+        let tiles: Vec<usize> = self.batch.iter().map(|(t, _)| *t).collect();
+        tracing::trace!("present tiles {tiles:?} ({why:?}, held {:.1} ms)", held.as_secs_f64() * 1000.0);
+        self.gather.record(why, tiles.len(), held);
+        if self.shared.frames.put_frame(self.batch.drain(..)) {
             self.shared.sink.emit(Event::Frame);
         }
     }
@@ -460,6 +519,7 @@ pub(super) fn decoder(shared: Arc<Shared>, rx: Receiver<DecoderMsg>, fb: Sender<
         batch: Vec::new(),
         batch_started: None,
         last_input: Instant::now(),
+        gather: GatherStats::new(),
         stats: DecodeStats::new(),
         dump: open_dump(),
     };
@@ -469,7 +529,7 @@ pub(super) fn decoder(shared: Arc<Shared>, rx: Receiver<DecoderMsg>, fb: Sender<
                 st.access_unit(tile, au);
                 st.last_input = Instant::now();
                 if st.batch_started.is_some_and(|t| t.elapsed() >= TILE_GATHER_MAX) {
-                    st.flush();
+                    st.flush(Flush::MaxHold);
                 }
             }
             Ok(DecoderMsg::Reset) => {
@@ -480,7 +540,7 @@ pub(super) fn decoder(shared: Arc<Shared>, rx: Receiver<DecoderMsg>, fb: Sender<
                 st.active_sps = None;
                 st.restart(st.decoder.backend());
             }
-            Err(RecvTimeoutError::Timeout) => st.flush(),
+            Err(RecvTimeoutError::Timeout) => st.flush(Flush::Idle),
             Err(RecvTimeoutError::Disconnected) => return,
         }
     }
