@@ -47,7 +47,7 @@ const DETACH_AFTER: Duration = Duration::from_millis(250);
 
 /// How long sent control data may go unacknowledged before the connection
 /// counts as dead.
-const CONTROL_ACK_TIMEOUT: Duration = Duration::from_secs(10);
+const CONTROL_ACK_TIMEOUT: Duration = Duration::from_secs(25);
 
 /// Connection settings.
 #[derive(Clone)]
