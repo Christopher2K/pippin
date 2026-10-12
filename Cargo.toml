@@ -1,0 +1,40 @@
+[package]
+name = "macshare"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+aes = "0.8"
+anyhow = "1.0.104"
+arboard = { version = "3.6.1", features = ["wayland-data-control"] }
+bytemuck = { version = "1.25.2", features = ["derive"] }
+cbc = "0.1"
+cipher = "0.4"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+crossbeam-channel = "0.5.17"
+ctr = "0.9"
+flate2 = "1.1.10"
+hmac = "0.12"
+libc = "0.2.190"
+num-bigint = "0.4"
+num-traits = "0.2.19"
+parking_lot = "0.12.5"
+pbkdf2 = "0.12"
+plist = "1.10.1"
+pollster = "1.0.1"
+rand = "0.8"
+rpassword = "7.5.4"
+rsa = "0.9"
+sha1 = "0.10"
+sha2 = "0.10"
+socket2 = "0.6.5"
+thiserror = "2.0.21"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+uuid = { version = "1.28.0", features = ["v4"] }
+wgpu = "30.0.1"
+winit = "0.30"
+
+[build-dependencies]
+bindgen = "0.73.2"
+pkg-config = "0.3.34"
