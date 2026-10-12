@@ -27,6 +27,7 @@ use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender};
 use parking_lot::Mutex;
 
+use crate::proto::auth::AuthError;
 use crate::proto::handshake::{self, ConnectParams, SessionMode};
 use crate::proto::messages::{self, DisplayRequest};
 use crate::proto::offers::MediaOffer;
@@ -47,7 +48,12 @@ pub struct Config {
     /// Software decoder threads; see `DecoderOptions`.
     pub decode_threads: u32,
     pub warmup: bool,
+    /// Told whether the host accepted the password; not called when the
+    /// connection fails for another reason.
+    pub on_auth: Option<AuthHook>,
 }
+
+pub type AuthHook = Arc<dyn Fn(bool) + Send + Sync>;
 
 /// A cursor shape from the host. `rgba` is `None` when the host referenced
 /// a cache entry we never received; the UI then shows its default cursor.
@@ -335,6 +341,13 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
     let negotiated = handshake::connect(&params);
     punching.store(false, Ordering::Relaxed);
     let _ = punch.join();
+    if let Some(hook) = &cfg.on_auth {
+        match &negotiated {
+            Ok(_) => hook(true),
+            Err(e) if matches!(e.downcast_ref::<AuthError>(), Some(AuthError::Rejected(_))) => hook(false),
+            Err(_) => {}
+        }
+    }
     let neg = negotiated?;
     tracing::debug!("server framebuffer {}x{}", neg.server_size.0, neg.server_size.1);
 

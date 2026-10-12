@@ -6,6 +6,7 @@
 //! (HEVC) mode.
 
 mod clipboard;
+mod credentials;
 #[cfg(test)]
 mod interop_tests;
 mod proto;
@@ -14,7 +15,9 @@ mod session;
 mod ui;
 mod video;
 
+use std::io::{BufRead, IsTerminal};
 use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -29,9 +32,19 @@ struct Cli {
     /// macOS account name.
     #[arg(short, long, env = "MACSHARE_USER")]
     user: String,
-    /// Account password. Prompted for if not set.
+    /// Account password. Otherwise taken from the keyring or prompted for.
     #[arg(long, env = "MACSHARE_PASSWORD", hide_env_values = true)]
     password: Option<String>,
+    /// Read the password from the first line of stdin.
+    #[arg(long, conflicts_with = "password")]
+    password_stdin: bool,
+    /// Save the password to the keyring once it authenticates, without
+    /// asking. Otherwise only a prompted password is offered for saving.
+    #[arg(long)]
+    save_password: bool,
+    /// Delete the keyring entry for this account and exit.
+    #[arg(long)]
+    forget_password: bool,
     #[arg(long, default_value_t = 5900)]
     port: u16,
     /// Share the console user's screen, or open a separate login session.
@@ -106,10 +119,44 @@ fn main() -> Result<()> {
         && !(1.0..=3.0).contains(&s) {
             bail!("--scale must be between 1 and 3");
         }
+    let account = credentials::account(&cli.user, &cli.host, cli.port);
+    let store: Arc<dyn credentials::Store> = Arc::new(credentials::Keyring);
+    if cli.forget_password {
+        match store.delete(&account) {
+            Ok(true) => println!("removed stored password for {account}"),
+            Ok(false) => println!("no stored password for {account}"),
+            Err(e) => tracing::warn!("keyring unavailable: {e:#}"),
+        }
+        return Ok(());
+    }
     let host = resolve_ipv4(&cli.host, cli.port)?;
-    let password = match cli.password {
-        Some(p) => p,
-        None => rpassword::prompt_password(format!("Password for {}@{}: ", cli.user, cli.host))?,
+    let mut stdin = cli.password_stdin.then(|| std::io::stdin().lock());
+    let (password, source) = credentials::resolve(
+        cli.password,
+        stdin.as_mut().map(|s| s as &mut dyn BufRead),
+        store.as_ref(),
+        &account,
+        || Ok(rpassword::prompt_password(format!("Password for {}@{}: ", cli.user, cli.host))?),
+    )?;
+    drop(stdin);
+    let on_auth: session::AuthHook = {
+        let (save, password) = (cli.save_password, password.clone());
+        let interactive = std::io::stdin().is_terminal();
+        Arc::new(move |ok| {
+            // Runs on the control thread; asking must not hold up the session.
+            let asks = ok && !save && credentials::should_save(source, save, interactive);
+            let (store, account, password) = (store.clone(), account.clone(), password.clone());
+            let finish = move || {
+                credentials::after_auth(store.as_ref(), &account, &password, source, ok, save, || {
+                    interactive && credentials::confirm_save(&mut std::io::stdin().lock())
+                })
+            };
+            if asks {
+                std::thread::spawn(finish);
+            } else {
+                finish();
+            }
+        })
     };
     let cfg = session::Config {
         host,
@@ -120,6 +167,7 @@ fn main() -> Result<()> {
         hardware_decode: !cli.no_hw,
         decode_threads: cli.decode_threads,
         warmup: !cli.no_warmup,
+        on_auth: Some(on_auth),
     };
     let opts = ui::Options {
         title: format!("{} — macshare", cli.host),

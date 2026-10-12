@@ -39,6 +39,7 @@ uuid = { version = "1.28.0", features = ["v4"] }
 wl-clipboard-rs = "0.9.4"
 wgpu = "30.0.1"
 winit = "0.30"
+keyring = { version = "3", features = ["async-secret-service", "async-io", "crypto-rust"] }
 
 [build-dependencies]
 bindgen = "0.73.2"
