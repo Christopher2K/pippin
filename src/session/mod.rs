@@ -230,14 +230,13 @@ impl Session {
                 let host = cfg.host;
                 let result = run(cfg, display, shared.clone(), &threads);
                 if !shared.stopped() {
-                    shared.sink.emit(match result {
-                        Err(e) => {
-                            tracing::debug!("session ended: {e:?}");
-                            let msg = crate::errors::classify(&e, host).to_string();
-                            if is_auth_rejection(&e) { Event::Closed(Some(msg)) } else { Event::Lost(msg) }
-                        }
-                        Ok(()) => Event::Lost("connection closed".into()),
-                    });
+                    // The reader only returns Ok once stopped; treat anything
+                    // else like a clean close by the host.
+                    let e = result.err().unwrap_or_else(|| Failure::HostClosed.into());
+                    tracing::debug!("session ended: {e:?}");
+                    let err = crate::errors::classify(&e, host);
+                    let msg = err.to_string();
+                    shared.sink.emit(if err.retryable() { Event::Lost(msg) } else { Event::Closed(Some(msg)) });
                 }
                 shared.stop.store(true, Ordering::Release);
             })
@@ -298,11 +297,6 @@ impl Session {
             let _ = t.join();
         }
     }
-}
-
-/// Wrong credentials won't get better by retrying.
-fn is_auth_rejection(e: &anyhow::Error) -> bool {
-    e.chain().any(|c| matches!(c.downcast_ref::<AuthError>(), Some(AuthError::Rejected(_))))
 }
 
 fn bind_udp(port: u16) -> Result<UdpSocket> {

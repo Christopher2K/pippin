@@ -23,6 +23,10 @@ pub enum Failure {
     ShareTimedOut,
     #[error("control connection lost")]
     ConnectionLost,
+    /// The host closed an established control connection cleanly (FIN),
+    /// e.g. the Mac's user ended the share or logged out.
+    #[error("host closed the control connection")]
+    HostClosed,
     /// The host never answered the media offer and no video followed.
     #[error("no media answer and no video")]
     NoMediaAnswer,
@@ -68,8 +72,31 @@ pub enum UserError {
     NoVideo(String),
     #[error("Connection to {0} lost.")]
     ConnectionLost(String),
+    #[error("{0} ended the session.")]
+    HostEnded(String),
     #[error("{0}")]
     Other(String),
+}
+
+impl UserError {
+    /// Whether a fresh session may fix this: only network-level trouble.
+    /// Credentials, host policy, a missing feature or blocked video won't
+    /// change by retrying, and a clean close means the host (or its user)
+    /// ended the session on purpose.
+    pub fn retryable(&self) -> bool {
+        match self {
+            UserError::Unreachable(_) | UserError::TimedOut(_) | UserError::Refused(_) | UserError::ConnectionLost(_) => {
+                true
+            }
+            UserError::HostRejected(..)
+            | UserError::AuthFailed(_)
+            | UserError::ShareDeclined(_)
+            | UserError::HighPerfUnavailable(_)
+            | UserError::NoVideo(_)
+            | UserError::HostEnded(_)
+            | UserError::Other(_) => false,
+        }
+    }
 }
 
 fn reason_suffix(r: &Option<String>) -> String {
@@ -87,6 +114,7 @@ pub fn classify(e: &anyhow::Error, host: Ipv4Addr) -> UserError {
             Failure::NoAppleAuth(_) | Failure::NoMediaAnswer => UserError::HighPerfUnavailable(host),
             Failure::ShareDeclined | Failure::ShareTimedOut => UserError::ShareDeclined(host),
             Failure::ConnectionLost => UserError::ConnectionLost(host),
+            Failure::HostClosed => UserError::HostEnded(host),
             Failure::NoVideo => UserError::NoVideo(host),
         };
     }
@@ -155,6 +183,42 @@ mod tests {
         assert!(matches!(c(Failure::NoMediaAnswer), UserError::HighPerfUnavailable(_)));
         assert!(matches!(c(Failure::NoVideo), UserError::NoVideo(_)));
         assert_eq!(c(Failure::ConnectionLost).to_string(), "Connection to 10.0.0.2 lost.");
+    }
+
+    #[test]
+    fn retryable() {
+        let c = |e: anyhow::Error| classify(&e, HOST).retryable();
+        for kind in [
+            ErrorKind::ConnectionRefused,
+            ErrorKind::TimedOut,
+            ErrorKind::HostUnreachable,
+            ErrorKind::NetworkUnreachable,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+        ] {
+            assert!(c(io(kind)), "{kind:?}");
+        }
+        // An established connection dropping abruptly.
+        let lost = |kind| anyhow::Error::new(std::io::Error::from(kind)).context(Failure::ConnectionLost);
+        assert!(c(lost(ErrorKind::ConnectionReset)));
+        assert!(c(lost(ErrorKind::TimedOut)));
+        // A clean FIN is the host ending the session.
+        let closed = anyhow::Error::new(std::io::Error::from(ErrorKind::UnexpectedEof)).context(Failure::HostClosed);
+        assert_eq!(classify(&closed, HOST).to_string(), "10.0.0.2 ended the session.");
+        assert!(!c(closed));
+
+        assert!(!c(anyhow::Error::new(AuthError::Rejected(1)).context("SRP authentication failed")));
+        for f in [
+            Failure::ServerRefused("busy".into()),
+            Failure::NoAppleAuth(vec![2]),
+            Failure::ShareDeclined,
+            Failure::ShareTimedOut,
+            Failure::NoMediaAnswer,
+            Failure::NoVideo,
+        ] {
+            assert!(!c(anyhow::Error::new(f)));
+        }
+        assert!(!c(io(ErrorKind::PermissionDenied)));
     }
 
     #[test]

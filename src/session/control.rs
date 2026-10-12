@@ -76,7 +76,16 @@ impl ControlReader {
                     tracing::debug!("control reader stopping: {e}");
                     return Ok(());
                 }
-                Err(e) => return Err(anyhow::Error::new(e).context(crate::errors::Failure::ConnectionLost)),
+                Err(e) => {
+                    // read_exact turns a FIN into UnexpectedEof; a reset or
+                    // TCP_USER_TIMEOUT surfaces as its own error kind.
+                    let marker = if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                        crate::errors::Failure::HostClosed
+                    } else {
+                        crate::errors::Failure::ConnectionLost
+                    };
+                    return Err(anyhow::Error::new(e).context(marker));
+                }
             }
         }
     }
