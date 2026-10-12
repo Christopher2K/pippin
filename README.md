@@ -49,8 +49,8 @@ pass show mac | ./target/release/macshare my-mac.local -u alice --password-stdin
 
 The password is taken from `--password`/`MACSHARE_PASSWORD`, then
 `--password-stdin`, then the desktop keyring (Secret Service, keyed by
-`user@host:port`), then an interactive prompt. Saving is opt-in: after a prompted password authenticates you are asked
-`Save password to keyring? [y/N]`, and `--save-password` saves any working
+`user@host:port`), then an interactive prompt. Saving is opt-in: right after the password prompt you are asked
+`Save password to keyring? [y/N]` (it is stored only once the Mac accepts it), and `--save-password` saves any working
 password without asking. A stored password the host rejects is removed so the
 next run prompts.
 `--forget-password` deletes the stored entry and exits.

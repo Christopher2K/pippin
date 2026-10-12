@@ -196,17 +196,23 @@ fn run() -> Result<()> {
         )?;
     }
     let mut event_loop = ui::event_loop()?;
+    let mut save = cli.save_password;
     let mode = credentials::choose(cli.dialog, target.is_some(), found.is_some(), tty);
     let (host, user, password, source) = match (mode, target, found) {
         (credentials::Mode::Direct, Some((h, u)), Some((p, s))) => (h, u, p, s),
         (credentials::Mode::Terminal, Some((h, u)), _) => {
             let p = rpassword::prompt_password(format!("Password for {u}@{h}: "))?;
+            // Asked up front, while the user is at the terminal; the password
+            // is only stored once the host accepts it.
+            if !cli.save_password && credentials::confirm_save(&mut std::io::stdin().lock()) {
+                save = true;
+            }
             (h, u, p, credentials::Source::Prompt)
         }
         (credentials::Mode::Dialog, ..) => return dialog_loop(&mut event_loop, &cli, &store),
         _ => bail!("the host and --user are required (or use --dialog)"),
     };
-    connect(&mut event_loop, &cli, &store, &host, &user, password, source, cli.save_password, tty, false).map(drop)
+    connect(&mut event_loop, &cli, &store, &host, &user, password, source, save, false).map(drop)
 }
 
 /// Shows the connect dialog until a session runs or the user cancels; any
@@ -245,7 +251,7 @@ fn dialog_loop(
             fields = f;
             continue;
         };
-        match connect(event_loop, cli, store, &f.host, &f.user, password, source, f.save, false, true)? {
+        match connect(event_loop, cli, store, &f.host, &f.user, password, source, f.save, true)? {
             Outcome::Done => return Ok(()),
             Outcome::Retry { msg, wrong_password } => {
                 error = Some(msg);
@@ -275,7 +281,6 @@ fn connect(
     password: String,
     source: credentials::Source,
     save: bool,
-    interactive: bool,
     from_dialog: bool,
 ) -> Result<Outcome> {
     let host = match resolve_ipv4(host_name, cli.port) {
@@ -295,8 +300,7 @@ fn connect(
         let (rejected, authed) = (rejected.clone(), authed.clone());
         Arc::new(move |ok| {
             rejected.store(!ok, Ordering::SeqCst);
-            if ok && (authed.swap(true, Ordering::SeqCst) || !save) {
-                // Already handled, or a question for after the window closes.
+            if ok && authed.swap(true, Ordering::SeqCst) {
                 return;
             }
             // Runs on the control thread; never asks here.
@@ -327,18 +331,6 @@ fn connect(
         reconnect: !cli.no_reconnect,
     };
     let result = ui::run(event_loop, cfg, opts);
-    // A terminal-prompted password that worked is offered for saving once
-    // the window has closed: asking while it is open would interleave with
-    // the log output on a detached thread and go unseen behind the window.
-    if authed.load(Ordering::SeqCst)
-        && !rejected.load(Ordering::SeqCst)
-        && !save
-        && credentials::should_save(source, save, interactive)
-    {
-        credentials::after_auth(store.as_ref(), &account, &password, source, true, save, || {
-            credentials::confirm_save(&mut std::io::stdin().lock())
-        });
-    }
     match result {
         Err(e) if from_dialog => {
             tracing::debug!("{e:?}");
