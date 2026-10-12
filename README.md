@@ -44,7 +44,23 @@ client window.
 cargo build --release
 ./target/release/macshare my-mac.local -u alice          # prompts for password
 MACSHARE_PASSWORD=... ./target/release/macshare 10.0.0.5 -u alice --session alt
+pass show mac | ./target/release/macshare my-mac.local -u alice --password-stdin
 ```
+
+The password is taken from `--password`/`MACSHARE_PASSWORD`, then
+`--password-stdin`, then the desktop keyring (Secret Service, keyed by
+`user@host:port`), then an interactive prompt. Saving is opt-in: after a prompted password authenticates you are asked
+`Save password to keyring? [y/N]`, and `--save-password` saves any working
+password without asking. A stored password the host rejects is removed so the
+next run prompts.
+`--forget-password` deletes the stored entry and exits.
+
+Without a terminal (e.g. launched from a `.desktop` file), a missing host,
+user or password is asked for in a small connect dialog instead; the host and
+user are prefilled from the command line. A password already in the keyring
+skips the dialog. Its "Save password in keyring" box is off by default and
+replaces the terminal `[y/N]` question. A rejected password brings the dialog
+back with an error. `--dialog` always shows it.
 
 `--session share` (default) shares the logged-in console user's screen.
 `--session alt` logs in to a separate virtual session as the authenticating
