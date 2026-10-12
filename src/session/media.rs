@@ -234,6 +234,12 @@ fn push_annexb(out: &mut Vec<u8>, nal: &[u8]) {
 /// CUDA sometimes accepts packets but never returns pictures (e.g. 4:4:4
 /// on GPUs without support); give up on it after this many access units.
 const CUDA_GRACE_AUS: u32 = 120;
+/// The host sends a frame's changed tiles back to back. Decoded pictures are
+/// held until input has been idle this long, so siblings still on the wire
+/// or in the decoder land in the same presented frame.
+const TILE_GATHER: Duration = Duration::from_millis(4);
+/// Never hold a picture longer than this, even under a steady stream.
+const TILE_GATHER_MAX: Duration = Duration::from_millis(25);
 
 struct DecodeLoop {
     shared: Arc<Shared>,
@@ -247,6 +253,10 @@ struct DecodeLoop {
     pts: i64,
     origin: HashMap<i64, (usize, Option<u16>)>,
     fed_without_output: Option<u32>,
+    /// Decoded pictures of the frame being gathered, and when it started.
+    batch: Vec<(usize, Picture)>,
+    batch_started: Option<Instant>,
+    last_input: Instant,
     stats: DecodeStats,
     /// MACSHARE_DUMP_HEVC: every access unit fed to the decoder, as Annex B,
     /// for offline analysis (ffmpeg -bsf:v trace_headers) and benchmarks.
@@ -397,8 +407,31 @@ impl DecodeLoop {
             let _ = self.fb.send(Feedback::LtrAck(d));
         }
         self.shared.touch(&self.shared.last_frame);
-        if self.shared.frames.put(tile, pic) {
+        // A second picture for the same tile means a new frame has begun.
+        if self.batch.iter().any(|(t, _)| *t == tile) {
+            self.flush();
+        }
+        self.batch_started.get_or_insert_with(Instant::now);
+        self.batch.push((tile, pic));
+        if self.batch.len() >= self.shared.tiles.load(Ordering::Relaxed) as usize {
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        self.batch_started = None;
+        if !self.batch.is_empty() && self.shared.frames.put_frame(self.batch.drain(..)) {
             self.shared.sink.emit(Event::Frame);
+        }
+    }
+
+    /// How long to wait for input before flushing a partial frame.
+    fn wait(&self) -> Duration {
+        match self.batch_started {
+            Some(t) => TILE_GATHER
+                .saturating_sub(self.last_input.elapsed())
+                .min(TILE_GATHER_MAX.saturating_sub(t.elapsed())),
+            None => Duration::from_millis(200),
         }
     }
 }
@@ -424,19 +457,30 @@ pub(super) fn decoder(shared: Arc<Shared>, rx: Receiver<DecoderMsg>, fb: Sender<
         pts: 0,
         origin: HashMap::new(),
         fed_without_output: cuda.then_some(0),
+        batch: Vec::new(),
+        batch_started: None,
+        last_input: Instant::now(),
         stats: DecodeStats::new(),
         dump: open_dump(),
     };
     while !shared.stopped() {
-        match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(DecoderMsg::Au { tile, au }) => st.access_unit(tile, au),
+        match rx.recv_timeout(st.wait()) {
+            Ok(DecoderMsg::Au { tile, au }) => {
+                st.access_unit(tile, au);
+                st.last_input = Instant::now();
+                if st.batch_started.is_some_and(|t| t.elapsed() >= TILE_GATHER_MAX) {
+                    st.flush();
+                }
+            }
             Ok(DecoderMsg::Reset) => {
+                st.batch.clear();
+                st.batch_started = None;
                 // New SSRC group: new parameter sets will follow.
                 st.params = ParamSets::default();
                 st.active_sps = None;
                 st.restart(st.decoder.backend());
             }
-            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Timeout) => st.flush(),
             Err(RecvTimeoutError::Disconnected) => return,
         }
     }

@@ -115,12 +115,16 @@ pub struct FrameStore {
 }
 
 impl FrameStore {
-    fn put(&self, tile: usize, pic: Picture) -> bool {
+    /// Publishes one host frame's pictures together, so the renderer never
+    /// shows some tiles from one frame and some from the previous (tearing).
+    fn put_frame(&self, pics: impl IntoIterator<Item = (usize, Picture)>) -> bool {
         let mut slots = self.slots.lock();
-        if slots.len() <= tile {
-            slots.resize_with(tile + 1, || None);
+        for (tile, pic) in pics {
+            if slots.len() <= tile {
+                slots.resize_with(tile + 1, || None);
+            }
+            slots[tile] = Some(pic);
         }
-        slots[tile] = Some(pic);
         !self.notified.swap(true, Ordering::AcqRel)
     }
 
