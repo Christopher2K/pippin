@@ -24,8 +24,13 @@ use render::Renderer;
 /// Settle time before asking the host to follow a window resize; each
 /// request restarts the host's encoder.
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(500);
-/// Pixels of smooth scrolling per wheel tick.
-const SCROLL_PIXELS_PER_TICK: f64 = 40.0;
+/// The host scrolls exactly one point per wheel click it receives (the
+/// press/release pairs are its only scroll input), so scrolling is sent as
+/// one click per point. A mouse-wheel notch becomes this many points.
+const SCROLL_POINTS_PER_LINE: f64 = 32.0;
+/// Clicks sent per input event at most; the rest carries over, so a hard
+/// flick doesn't flood the control channel in one go.
+const SCROLL_MAX_CLICKS_PER_EVENT: f64 = 200.0;
 
 pub struct Options {
     pub title: String,
@@ -101,13 +106,15 @@ impl App {
             }
     }
 
-    fn scroll(&mut self, ticks: f64) {
-        self.scroll_accum += ticks;
-        while self.scroll_accum.abs() >= 1.0 {
-            let up = self.scroll_accum > 0.0;
-            self.scroll_accum -= if up { 1.0 } else { -1.0 };
+    /// Scrolls by `points` (positive is up), carrying any fraction.
+    fn scroll(&mut self, points: f64) {
+        self.scroll_accum += points;
+        let clicks = self.scroll_accum.trunc().clamp(-SCROLL_MAX_CLICKS_PER_EVENT, SCROLL_MAX_CLICKS_PER_EVENT);
+        self.scroll_accum -= clicks;
+        let bit = if clicks > 0.0 { BTN_SCROLL_UP } else { BTN_SCROLL_DOWN };
+        for _ in 0..clicks.abs() as u32 {
             // Each press/release pair is one wheel click on the host.
-            self.send_pointer(self.buttons | if up { BTN_SCROLL_UP } else { BTN_SCROLL_DOWN });
+            self.send_pointer(self.buttons | bit);
             self.send_pointer(self.buttons);
         }
     }
@@ -295,11 +302,15 @@ impl ApplicationHandler<Event> for App {
                 self.send_pointer(self.buttons);
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let ticks = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y as f64,
-                    MouseScrollDelta::PixelDelta(p) => p.y / SCROLL_PIXELS_PER_TICK,
+                let points = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y as f64 * SCROLL_POINTS_PER_LINE,
+                    // Physical pixels → logical points, so the remote
+                    // content tracks the fingers 1:1.
+                    MouseScrollDelta::PixelDelta(p) => {
+                        p.y / self.window.as_ref().map_or(1.0, |w| w.scale_factor())
+                    }
                 };
-                self.scroll(ticks);
+                self.scroll(points);
             }
             _ => {}
         }
