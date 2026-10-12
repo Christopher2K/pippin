@@ -242,10 +242,17 @@ fn connect(
     };
     let account = credentials::account(user, host_name, cli.port);
     let rejected = Arc::new(AtomicBool::new(false));
+    // The hook runs for every reconnect too; save (or ask) only for the
+    // first success. One connect() call is one password, so a new password
+    // typed into the dialog after a rejection gets its own chance.
+    let save_handled = Arc::new(AtomicBool::new(false));
     let on_auth: session::AuthHook = {
         let (store, password, rejected) = (store.clone(), password.clone(), rejected.clone());
         Arc::new(move |ok| {
             rejected.store(!ok, Ordering::SeqCst);
+            if ok && save_handled.swap(true, Ordering::SeqCst) {
+                return;
+            }
             // Runs on the control thread; asking must not hold up the session.
             let asks = ok && !save && credentials::should_save(source, save, interactive);
             let (store, account, password) = (store.clone(), account.clone(), password.clone());
