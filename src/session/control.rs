@@ -76,7 +76,7 @@ impl ControlReader {
                     tracing::debug!("control reader stopping: {e}");
                     return Ok(());
                 }
-                Err(e) => return Err(anyhow::Error::new(e).context("control connection lost")),
+                Err(e) => return Err(anyhow::Error::new(e).context(crate::errors::Failure::ConnectionLost)),
             }
         }
     }

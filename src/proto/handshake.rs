@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 
 use super::auth::{self, AuthError};
+use crate::errors::Failure;
 use super::messages::{self, DisplayRequest, ENC_RECORD_KEYS};
 use super::offers::{CanvasInfo, MediaOffer, parse_answer};
 use super::record::{Opened, RecordKeys, RecordOpener, RecordSealer};
@@ -75,7 +76,7 @@ fn banner(s: &mut TcpStream) -> Result<Vec<u8>> {
     if n[0] == 0 {
         let len = super::wire::read_u32(s)? as usize;
         let reason = read_vec(s, len.min(4096))?;
-        bail!("server refused connection: {}", String::from_utf8_lossy(&reason));
+        return Err(Failure::ServerRefused(String::from_utf8_lossy(&reason).into_owned()).into());
     }
     Ok(read_vec(s, n[0] as usize)?)
 }
@@ -88,7 +89,7 @@ fn open(addr: SocketAddrV4) -> Result<TcpStream> {
     s.set_write_timeout(Some(IO_TIMEOUT))?;
     let types = banner(&mut s)?;
     if !types.contains(&33) {
-        bail!("server does not offer Apple auth (security types {types:?})");
+        return Err(Failure::NoAppleAuth(types).into());
     }
     Ok(s)
 }
@@ -195,13 +196,13 @@ fn session_select(s: &mut TcpStream, p: &ConnectParams, auth_key: &[u8; 16]) -> 
     let n = match s.read(&mut ack) {
         Ok(n) => n,
         Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
-            bail!("timed out waiting for the session to be shared or created")
+            return Err(Failure::ShareTimedOut.into());
         }
         Err(e) => return Err(e.into()),
     };
     s.set_read_timeout(Some(IO_TIMEOUT))?;
     if n == 0 {
-        bail!("host declined the session request");
+        return Err(Failure::ShareDeclined.into());
     }
     Ok(())
 }
@@ -266,6 +267,7 @@ pub fn connect(p: &ConnectParams) -> Result<Negotiated> {
     let (mut s, mut auth_key) = authenticate(p)?;
     let mut server_size = client_init(&mut s)?;
 
+    let mut shared_console = false;
     if session_select_pending(&s)? {
         if p.session_mode == SessionMode::Alt {
             // Screen Sharing.app re-authenticates on a fresh connection
@@ -275,6 +277,7 @@ pub fn connect(p: &ConnectParams) -> Result<Negotiated> {
             server_size = client_init(&mut s)?;
         }
         session_select(&mut s, p, &auth_key)?;
+        shared_console = p.session_mode == SessionMode::Share;
     }
 
     s.write_all(&messages::viewer_info())?;
@@ -282,7 +285,11 @@ pub fn connect(p: &ConnectParams) -> Result<Negotiated> {
     s.write_all(&messages::set_display_configuration(&p.display))?;
     s.write_all(&messages::set_encodings())?;
 
-    let keys = read_record_keys(&mut s, &auth_key)?;
+    let keys = read_record_keys(&mut s, &auth_key).map_err(|e| {
+        // A console user who refuses the share request just drops us.
+        let eof = e.downcast_ref::<std::io::Error>().is_some_and(|io| io.kind() == std::io::ErrorKind::UnexpectedEof);
+        if shared_console && eof { e.context(Failure::ShareDeclined) } else { e }
+    })?;
     let mut sealer = RecordSealer::new(&keys);
     let mut opener = RecordOpener::new(&keys);
     s.write_all(&messages::post_encryption_toggle())?;

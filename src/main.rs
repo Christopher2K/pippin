@@ -6,6 +6,7 @@
 //! (HEVC) mode.
 
 mod clipboard;
+mod errors;
 #[cfg(test)]
 mod interop_tests;
 mod proto;
@@ -86,7 +87,20 @@ fn resolve_ipv4(host: &str, port: u16) -> Result<Ipv4Addr> {
         .with_context(|| format!("{host} has no IPv4 address"))
 }
 
-fn main() -> Result<()> {
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            // Session failures arrive already classified; full chains for
+            // everything are at debug level.
+            tracing::debug!("{e:?}");
+            eprintln!("macshare: {e:#}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
     let default_filter = match cli.verbose {
         0 => "macshare=info,wgpu=error,naga=error",
