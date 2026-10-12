@@ -76,7 +76,7 @@ impl DisplayRequest {
     /// Picks the logical size and scale so the host's backing store matches
     /// `pixels` as closely as its 3840×2160 cap allows.
     pub fn for_pixels(px_w: u32, px_h: u32, scale: f64) -> Self {
-        let scale = scale.clamp(1.0, 3.0);
+        let scale = scale.clamp(0.5, 3.0);
         let (max_w, max_h) = Self::MAX_BACKING;
         let fit = (max_w as f64 / px_w.max(1) as f64)
             .min(max_h as f64 / px_h.max(1) as f64)

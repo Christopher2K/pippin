@@ -65,6 +65,12 @@ struct Cli {
     /// Defaults to 2 on HiDPI screens, else 1.
     #[arg(long)]
     scale: Option<f64>,
+    /// Fraction of the window's pixels the Mac renders and streams; the
+    /// picture is scaled up locally. 0.5 on a Retina screen streams a quarter
+    /// of the pixels (much cheaper to decode, softer text). The Mac's layout
+    /// is unchanged.
+    #[arg(long, default_value_t = 1.0)]
+    render_scale: f64,
     /// Keep the remote resolution fixed instead of following the window.
     #[arg(long)]
     no_auto_resize: bool,
@@ -157,6 +163,9 @@ fn run() -> Result<()> {
         && !(1.0..=3.0).contains(&s) {
             bail!("--scale must be between 1 and 3");
         }
+    if !(0.25..=1.0).contains(&cli.render_scale) {
+        bail!("--render-scale must be between 0.25 and 1");
+    }
     let store: Arc<dyn credentials::Store> = Arc::new(credentials::Keyring);
     if cli.forget_password {
         let (Some(host), Some(user)) = (&cli.host, &cli.user) else {
@@ -311,6 +320,7 @@ fn connect(
         host_name: host_name.to_owned(),
         size: cli.size,
         scale: cli.scale,
+        render_scale: cli.render_scale,
         auto_resize: !cli.no_auto_resize,
         swap_ctrl_cmd: cli.swap_ctrl_cmd,
         reconnect: !cli.no_reconnect,

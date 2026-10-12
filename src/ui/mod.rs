@@ -44,6 +44,8 @@ pub struct Options {
     pub size: (u32, u32),
     /// Backing scale to request; `None` follows the window's scale factor.
     pub scale: Option<f64>,
+    /// Fraction of window pixels to stream (see `--render-scale`).
+    pub render_scale: f64,
     pub auto_resize: bool,
     pub swap_ctrl_cmd: bool,
     /// Start a new session when an established one drops.
@@ -102,7 +104,11 @@ struct App {
 impl App {
     fn display_request(&self, size: PhysicalSize<u32>, scale_factor: f64) -> DisplayRequest {
         let scale = self.opts.scale.unwrap_or(if scale_factor >= 1.5 { 2.0 } else { 1.0 });
-        DisplayRequest::for_pixels(size.width, size.height, scale)
+        // Same logical size, fewer backing pixels: the Mac lays out as usual
+        // and we scale up its smaller picture.
+        let r = self.opts.render_scale;
+        let px = |v: u32| (v as f64 * r).round() as u32;
+        DisplayRequest::for_pixels(px(size.width), px(size.height), scale * r)
     }
 
     fn send_resize(&mut self) {
