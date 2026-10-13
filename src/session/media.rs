@@ -335,7 +335,7 @@ pub(super) fn video_rx(
                         nacked.remove(&(p.ssrc, p.seq));
                         if let Some(after) = watch.arrived(p.ssrc, p.seq, now) {
                             // A retransmission, or a late original: either
-                            // way a long enough hold would have been filled.
+                            // way the packet NACKed did turn up.
                             shared.metrics.nack_arrived(after);
                             // Only an arrival a hold could have waited for
                             // argues for holding.
@@ -758,7 +758,10 @@ impl DecodeLoop {
             let _ = std::io::Write::write_all(d, &annexb);
         }
         let started = Instant::now();
-        self.decoder.set_lenient(self.lossy);
+        // Concealed pictures may still be in the decoder after the
+        // keyframe that ended the loss was fed.
+        let concealed_in_flight = self.origin.values().any(|o| o.4);
+        self.decoder.set_lenient(self.lossy || concealed_in_flight);
         let ok = self.decoder.decode(&annexb, self.pts, &mut |p| pictures.push(p));
         let slices = au.nalus.iter().filter(|n| hevc::is_slice(n)).count();
         let took = started.elapsed();
@@ -842,7 +845,10 @@ impl DecodeLoop {
     /// first such request opens an outage for the recovery metrics, which
     /// the first picture of a later epoch closes.
     fn loss_keyframe(&mut self, tile: usize, epoch: u64, cause: KeyframeCause) {
-        self.shared.metrics.outage(epoch, Instant::now());
+        // A loss from before the latest IRAP was already repaired by it.
+        if epoch >= self.epoch {
+            self.shared.metrics.outage(epoch, Instant::now());
+        }
         let _ = self.fb.send(Feedback::Keyframe(Some(tile), cause));
     }
 
