@@ -20,7 +20,59 @@ const MODE_AUDIO: i64 = 8;
 
 const HEVC_PARAMS: &[u8] =
     b"FLS;MS:-1;LF:-1;LTR;CABAC;POS:0;EOD:1;HTS:2;RR:3;AR:16/9,5/8;XR:16/9,5/8;";
+/// The same without the `LTR;` capability, as the reference offers with
+/// long-term references off.
+const HEVC_PARAMS_NO_LTR: &[u8] = b"FLS;MS:-1;LF:-1;CABAC;POS:0;EOD:1;HTS:2;RR:3;AR:16/9,5/8;XR:16/9,5/8;";
 const AVC_PARAMS: &[u8] = b"FLS;LF:-1;POS:5;EOD:1;HTS:2;RR:3;POSE:4;AR:16/9,5/8;XR:16/9,5/8;";
+
+/// Stream config flag bits in the 0x1c header (see [`MediaOffer::message`]).
+/// "60 fps supported" for video stream 1 and stream 2; with both clear the
+/// host is expected to encode at 30 fps (unverified). The daemon forces both
+/// on for message version <= 1; we send version 3, so clearing them sticks.
+///
+/// The word is written big-endian although the host reads it raw: it
+/// forwards the value to the streaming agent, which tests the bits after the
+/// IPC boundary has byte-swapped it, so big-endian is what arrives. The
+/// reference found this the hard way (negotiation.py:194-204): big-endian
+/// `00 00 00 07` makes the host honour the no-cursor bit, little-endian
+/// leaves the cursor baked into the video. The fps bits travel the same way.
+const FLAG_60FPS_STREAM1: u32 = 1;
+const FLAG_60FPS_STREAM2: u32 = 2;
+/// The host draws no cursor into the video; we show its shapes locally.
+const FLAG_NO_CURSOR: u32 = 4;
+
+/// Video offer choices that the client can vary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OfferOptions {
+    /// Advertise 60 fps (flag bits 0 and 1); false asks for 30.
+    pub fps60: bool,
+    /// Advertise long-term reference pictures (LTRP): `LTR;` in the HEVC
+    /// parameter string and ltrpEnabled (field 7). The host is said to use
+    /// the last LTR we acknowledged as the reference for its next P picture
+    /// after a loss instead of sending an IDR; that is the reference's
+    /// reading of the protocol, not something it has demonstrated, and the
+    /// RFC draft lists the LTR semantics as a gap.
+    pub ltr: bool,
+}
+
+impl Default for OfferOptions {
+    fn default() -> Self {
+        Self { fps60: true, ltr: true }
+    }
+}
+
+/// The 0x1c header flags. A separate login session drops the second-stream
+/// 60 fps bit, as the native viewer does.
+fn stream_flags(alt_session: bool, opts: OfferOptions) -> u32 {
+    let mut flags = FLAG_NO_CURSOR;
+    if opts.fps60 {
+        flags |= FLAG_60FPS_STREAM1;
+        if !alt_session {
+            flags |= FLAG_60FPS_STREAM2;
+        }
+    }
+    flags
+}
 
 /// Audio bitrate tiers Screen Sharing.app advertises in field 9.
 const AUDIO_TIERS: [(u64, u64, Option<u64>); 10] = [
@@ -140,7 +192,7 @@ fn endpoint_info() -> Vec<u8> {
     out
 }
 
-fn media_blob(mode: i64, session_id: u32, audio: bool) -> Vec<u8> {
+fn media_blob(mode: i64, session_id: u32, audio: bool, ltr: bool) -> Vec<u8> {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
@@ -157,18 +209,21 @@ fn media_blob(mode: i64, session_id: u32, audio: bool) -> Vec<u8> {
             .bytes(2, &ea)
             .bytes(2, &e)
             .bytes(2, &ea)
-            .bytes(3, HEVC_PARAMS)
+            .bytes(3, if ltr { HEVC_PARAMS } else { HEVC_PARAMS_NO_LTR })
             .int(4, 1)
             .0;
         let bank_100 =
             Pb::default().int(1, 100).bytes(2, &e).bytes(2, &ea).bytes(3, AVC_PARAMS).int(4, 14).0;
+        // Field 2 is allowRTCPFB and 7 ltrpEnabled. The reference clears
+        // both with LTR off; we keep RTCP feedback allowed so NACKs and
+        // keyframe requests are unaffected and only LTR varies.
         let d = Pb::default()
             .int(1, session_id as u64)
             .int(2, 1)
             .bytes(3, &bank_123)
             .bytes(3, &bank_100)
             .int(6, TILES_PER_FRAME)
-            .int(7, 1)
+            .int(7, ltr as u64)
             .int(8, 63)
             .int(9, 1)
             .int(12, 1)
@@ -214,13 +269,13 @@ fn zlib(data: &[u8]) -> Vec<u8> {
     e.finish().expect("in-memory zlib")
 }
 
-fn offer_plist(mode: i64, session_id: u32, audio: bool) -> Vec<u8> {
+fn offer_plist(mode: i64, session_id: u32, audio: bool, ltr: bool) -> Vec<u8> {
     let mut dict = plist::Dictionary::new();
     dict.insert("avcMediaStreamOptionRemoteEndpointInfo".into(), plist::Value::Data(endpoint_info()));
     dict.insert("avcMediaStreamNegotiatorMode".into(), plist::Value::Integer(mode.into()));
     dict.insert(
         "avcMediaStreamNegotiatorMediaBlob".into(),
-        plist::Value::Data(zlib(&media_blob(mode, session_id, audio))),
+        plist::Value::Data(zlib(&media_blob(mode, session_id, audio, ltr))),
     );
     dict.insert(
         "avcMediaStreamOptionCallID".into(),
@@ -240,7 +295,8 @@ pub struct MediaOffer {
     pub video_key_s: [u8; SRTP_BLOB_LEN],
     pub video_ssrc: u32,
     pub audio_ssrc: u32,
-    flags: u32,
+    alt_session: bool,
+    opts: OfferOptions,
     video_offer: Vec<u8>,
     audio_offer: Vec<u8>,
 }
@@ -248,7 +304,7 @@ pub struct MediaOffer {
 impl MediaOffer {
     /// `alt_session` drops the second-stream 60 fps bit, as the native
     /// viewer does for a separate login session.
-    pub fn generate(audio: bool, alt_session: bool) -> Self {
+    pub fn generate(audio: bool, alt_session: bool, opts: OfferOptions) -> Self {
         let key = || {
             let mut k = [0u8; SRTP_BLOB_LEN];
             OsRng.fill_bytes(&mut k);
@@ -264,10 +320,20 @@ impl MediaOffer {
             video_key_s: vks,
             video_ssrc,
             audio_ssrc,
-            flags: if alt_session { 5 } else { 7 },
-            video_offer: offer_plist(MODE_VIDEO, video_ssrc, false),
-            audio_offer: offer_plist(MODE_AUDIO, audio_ssrc, audio),
+            alt_session,
+            opts,
+            video_offer: offer_plist(MODE_VIDEO, video_ssrc, false, opts.ltr),
+            audio_offer: offer_plist(MODE_AUDIO, audio_ssrc, audio, false),
         }
+    }
+
+    /// Changes the offer for the next [`message`](Self::message), keeping
+    /// the keys and SSRCs, so a mid-session re-offer can renegotiate it.
+    pub fn set_options(&mut self, opts: OfferOptions) {
+        if opts.ltr != self.opts.ltr {
+            self.video_offer = offer_plist(MODE_VIDEO, self.video_ssrc, false, opts.ltr);
+        }
+        self.opts = opts;
     }
 
     /// Serializes the 0x1c message. The same message (same keys) is re-sent
@@ -284,7 +350,7 @@ impl MediaOffer {
         // the cursor into the video" (bit 2). Big-endian on the wire: the
         // agent sees the value after an IPC byte swap, so the host's raw
         // little-endian load is misleading.
-        buf[6..10].copy_from_slice(&self.flags.to_be_bytes());
+        buf[6..10].copy_from_slice(&stream_flags(self.alt_session, self.opts).to_be_bytes());
         buf[10..12].copy_from_slice(&(a as u16).to_be_bytes());
         buf[12..14].copy_from_slice(&(v as u16).to_be_bytes());
         buf[0x14..0x24].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
@@ -305,6 +371,8 @@ pub struct CanvasInfo {
     pub width: u32,
     pub height: u32,
     pub tiles: u32,
+    /// ltrpEnabled (field 7) as answered, if present.
+    pub ltrp: Option<bool>,
 }
 
 /// Finds the length of a binary plist starting at `buf[0]` by locating a
@@ -350,13 +418,14 @@ pub fn parse_answer(data: &[u8]) -> Option<CanvasInfo> {
         }
         for (field, value) in PbReader::new(&raw) {
             let (5, PbValue::Bytes(video)) = (field, value) else { continue };
-            let mut c = CanvasInfo { width: 0, height: 0, tiles: 0 };
+            let mut c = CanvasInfo { width: 0, height: 0, tiles: 0, ltrp: None };
             for (f, v) in PbReader::new(video) {
                 if let PbValue::Int(v) = v {
                     match f {
                         4 => c.width = v as u32,
                         5 => c.height = v as u32,
                         6 => c.tiles = v as u32,
+                        7 => c.ltrp = Some(v != 0),
                         _ => {}
                     }
                 }
@@ -386,7 +455,7 @@ mod tests {
 
     #[test]
     fn message_layout() {
-        let offer = MediaOffer::generate(false, false);
+        let offer = MediaOffer::generate(false, false, OfferOptions::default());
         let m = offer.message();
         let a = u16::from_be_bytes([m[10], m[11]]) as usize;
         let v = u16::from_be_bytes([m[12], m[13]]) as usize;
@@ -400,7 +469,7 @@ mod tests {
     #[test]
     fn answer_round_trip() {
         // Build an "answer" shaped like ours but with canvas fields filled in.
-        let d = Pb::default().int(1, 5).int(4, 2560).int(5, 1440).int(6, 4).0;
+        let d = Pb::default().int(1, 5).int(4, 2560).int(5, 1440).int(6, 4).int(7, 0).0;
         let blob = Pb::default().int(1, 1).bytes(5, &d).0;
         let mut dict = plist::Dictionary::new();
         dict.insert("avcMediaStreamNegotiatorMediaBlob".into(), plist::Value::Data(zlib(&blob)));
@@ -409,15 +478,94 @@ mod tests {
         let mut msg = vec![0u8, 0, 0, 1, 0xde, 0xad];
         msg.extend_from_slice(&pl);
         msg.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9]);
-        assert_eq!(parse_answer(&msg), Some(CanvasInfo { width: 2560, height: 1440, tiles: 4 }));
+        assert_eq!(parse_answer(&msg), Some(CanvasInfo { width: 2560, height: 1440, tiles: 4, ltrp: Some(false) }));
     }
 
     #[test]
     fn video_ssrc_is_in_blob() {
-        let blob = media_blob(MODE_VIDEO, 0xDEADBEEF, false);
+        let blob = media_blob(MODE_VIDEO, 0xDEADBEEF, false, true);
         let (_, desc) = PbReader::new(&blob).find(|(f, _)| *f == 5).unwrap();
         let PbValue::Bytes(desc) = desc else { panic!() };
         let (f, v) = PbReader::new(desc).next().unwrap();
         assert!(f == 1 && matches!(v, PbValue::Int(0xDEADBEEF)));
+    }
+
+    #[test]
+    fn fps_flag_bits() {
+        let fps = |fps60| OfferOptions { fps60, ..Default::default() };
+        // Bit 2 (no cursor) always; bits 0/1 are 60 fps for streams 1/2.
+        assert_eq!(stream_flags(false, fps(true)), 7);
+        assert_eq!(stream_flags(true, fps(true)), 5);
+        assert_eq!(stream_flags(false, fps(false)), 4);
+        assert_eq!(stream_flags(true, fps(false)), 4);
+        let mut offer = MediaOffer::generate(false, false, OfferOptions::default());
+        let keys = (offer.video_key_s, offer.video_ssrc);
+        offer.set_options(fps(false));
+        let m = offer.message();
+        assert_eq!(&m[6..10], &[0, 0, 0, 4]);
+        // A re-offer keeps the keys and SSRCs.
+        assert_eq!((offer.video_key_s, offer.video_ssrc), keys);
+        let alt = MediaOffer::generate(false, true, OfferOptions::default());
+        assert_eq!(&alt.message()[6..10], &[0, 0, 0, 5]);
+    }
+
+    /// The video description (MediaBlob field 5) of an offer plist.
+    fn video_desc(plist_bytes: &[u8]) -> Vec<u8> {
+        let plist::Value::Dictionary(d) = plist::from_bytes(plist_bytes).unwrap() else { panic!() };
+        let blob = d.get("avcMediaStreamNegotiatorMediaBlob").and_then(|v| v.as_data()).unwrap();
+        let mut raw = Vec::new();
+        std::io::Read::read_to_end(&mut flate2::read::ZlibDecoder::new(blob), &mut raw).unwrap();
+        let Some((_, PbValue::Bytes(desc))) = PbReader::new(&raw).find(|(f, _)| *f == 5) else { panic!() };
+        desc.to_vec()
+    }
+
+    #[test]
+    fn ltr_option_in_video_offer() {
+        for ltr in [true, false] {
+            let mut offer = MediaOffer::generate(false, false, OfferOptions::default());
+            offer.set_options(OfferOptions { ltr, ..Default::default() });
+            let desc = video_desc(&offer.video_offer);
+            let f7 = PbReader::new(&desc).find_map(|(f, v)| match (f, v) {
+                (7, PbValue::Int(v)) => Some(v),
+                _ => None,
+            });
+            assert_eq!(f7, Some(ltr as u64));
+            assert_eq!(find(&desc, b";LTR;").is_some(), ltr);
+            // RTCP feedback stays allowed either way.
+            assert!(PbReader::new(&desc).any(|(f, v)| f == 2 && matches!(v, PbValue::Int(1))));
+        }
+    }
+
+    /// The video description (MediaBlob field 5) of iShareScreen's default
+    /// `_build_mediablob(7, ...)`, written out by hand from offers.py.
+    #[test]
+    fn video_description_matches_reference() {
+        fn field(tag: u8, body: &[u8]) -> Vec<u8> {
+            let mut v = vec![tag, body.len() as u8];
+            v.extend_from_slice(body);
+            v
+        }
+        let res = field(0x12, &[0x08, 1, 0x10, 1, 0x18, 0xc3, 0x87, 3, 0x20, 0]);
+        let res_alt = field(0x12, &[0x08, 1, 0x10, 2, 0x18, 0xc3, 0x87, 3, 0x20, 0]);
+        let mut bank_123 = vec![0x08, 123];
+        for r in [&res, &res_alt, &res, &res_alt] {
+            bank_123.extend_from_slice(r);
+        }
+        bank_123.extend(field(0x1a, b"FLS;MS:-1;LF:-1;LTR;CABAC;POS:0;EOD:1;HTS:2;RR:3;AR:16/9,5/8;XR:16/9,5/8;"));
+        bank_123.extend_from_slice(&[0x20, 1]);
+        let mut bank_100 = vec![0x08, 100];
+        bank_100.extend(res.iter().chain(&res_alt));
+        bank_100.extend(field(0x1a, b"FLS;LF:-1;POS:5;EOD:1;HTS:2;RR:3;POSE:4;AR:16/9,5/8;XR:16/9,5/8;"));
+        bank_100.extend_from_slice(&[0x20, 14]);
+
+        let mut want = vec![0x08, 5, 0x10, 1];
+        want.extend(field(0x1a, &bank_123));
+        want.extend(field(0x1a, &bank_100));
+        want.extend_from_slice(&[0x30, 4, 0x38, 1, 0x40, 63, 0x48, 1, 0x60, 1]);
+
+        let blob = media_blob(MODE_VIDEO, 5, false, true);
+        let (_, desc) = PbReader::new(&blob).find(|(f, _)| *f == 5).unwrap();
+        let PbValue::Bytes(desc) = desc else { panic!() };
+        assert_eq!(desc, &want[..]);
     }
 }

@@ -19,20 +19,82 @@ client window.
   Wayland via `wlr-data-control` / `ext-data-control`.
 - **Native cursor.** The Mac's cursor shapes become local cursors, so
   pointer movement has no round-trip lag.
-- **Hardware decoding.** CUDA (NVDEC) when available, with a fallback to
-  multithreaded software decoding.
-- **Loss recovery.** NACKs, keyframe requests, long-term-reference acks,
-  and stall detection.
+- **Hardware decoding.** CUDA (NVDEC), then VAAPI, then multithreaded
+  software decoding. The stream is HEVC 4:4:4, which NVIDIA (Turing and
+  later) and Intel (Ice Lake and later) decode in hardware; most AMD GPUs
+  only decode 4:2:0. A hardware decoder that rejects the stream, emits
+  nothing, or leaves libavcodec decoding in software is dropped for the
+  next one. `--decoder auto|cuda|vaapi|software` picks one (`--no-hw` is
+  `software`); `--vaapi-device` or `MACSHARE_VAAPI_DEVICE` picks the render
+  node, e.g. `/dev/dri/renderD129`. Decoded planes go to the GPU as-is
+  (NV12/NV24 and packed VUYX included) and are converted in the shader.
+- **Loss recovery.** NACKs (retried once), with frames that have holes held
+  briefly for the retransmission; keyframe requests, long-term-reference
+  acks, and stall detection. `--hold auto` (default) stops holding once 20
+  holds in a row go unfilled, since a host that doesn't retransmit makes
+  each hold pure delay; `on`/`off` fix it. `--after-loss idr` (default) drops
+  pictures until the next keyframe, freezing the picture; `conceal` keeps
+  decoding what arrived, so it keeps moving but smeared until then.
+
+## Lossy networks
+
+Measured against a real Mac:
+
+- The Mac does not retransmit video. Across hundreds of NACKs, none of the
+  NACKed packets arrived within 1 s.
+- So every loss costs a keyframe (about 57 KB), and at 1% packet loss the
+  picture is frozen about half the time with the defaults.
+- FIR vs PLI, long-term references off, 30 fps and `--scale` made no
+  measurable difference.
+- `--after-loss conceal` turns about a fifth of the frozen time into
+  moving but smeared video.
+- `--render-scale 0.5` is the lever for slow links: on a Retina window the
+  Mac renders and streams a quarter of the pixels, so keyframes are smaller,
+  at the cost of softer text. macOS only renders whole scales, so it needs
+  a 2x window.
+
+## Experiments
+
+`--stats-json stats.jsonl` appends one JSON object per second: the
+operating point (including the decoder in use) and what the host answered
+(canvas, LTR, per-tile picture rate), packet and byte rates, per-tile loss
+before and after repair and jitter, NACKs and how fast retransmissions
+arrive, holds, keyframe requests by kind and by cause, keyframe sizes,
+recovery time per loss outage, frozen and concealed time, decode times,
+presented frames and round trip. Each field is documented in
+`src/session/metrics.rs`.
+
+For switching levers mid-session without a GUI, set
+`MACSHARE_CONTROL_FIFO=/tmp/macshare.ctl` (created as a FIFO if missing) and
+write commands to it, e.g. `echo 'hold off' > /tmp/macshare.ctl`:
+`render_scale 1|0.5`, `fps 60|30`, `recovery fir|pli|fir+pli`,
+`hold auto|on|off`, `ltr on|off`, `after_loss idr|conceal`, `keyframe`
+(ask for one now) and `restart` (reconnect with the current settings; with
+`--no-reconnect` it exits instead). `recovery` (the keyframe request kind;
+default fir+pli), `ltr` (long-term references; default on) and `fps`
+(default 60) have no command-line flags: they are experiment knobs that
+made no measurable difference on a lossy link, because the Mac doesn't
+retransmit. `recovery`, `hold` and `after_loss` apply at once;
+`render_scale` re-requests the display like a resize; `fps` and `ltr`
+re-offer the media session on the open connection.
 
 ## Requirements
 
 - FFmpeg development libraries (`libavcodec`, `libavutil`) and `clang`
   (for bindgen) at build time.
 - A Vulkan, GL, or other wgpu-supported GPU.
+- Optional, for hardware decoding: an FFmpeg built with CUDA/NVDEC (NVIDIA
+  driver) and/or VAAPI support, plus a VAAPI driver: `intel-media-driver`
+  on Intel, Mesa's `radeonsi` on AMD, or `libva-nvidia-driver` on NVIDIA.
+  `vainfo` (from `libva-utils`) lists what the driver decodes; look for
+  `VAProfileHEVCMain444`.
 - On the Mac: System Settings → General → Sharing → Screen Sharing enabled
   for the account you log in with.
 - UDP ports 5900 and 5901 free locally. The host sends media to them.
 - A large socket receive buffer. Video bursts overflow the kernel default:
+  at 4K under heavy motion the queue peaked at 667 KB (no drops with
+  `rmem_max` at 7 MB), more than the stock ~416 KB effective buffer holds.
+  The client asks for 8 MB and warns if it gets less than 2 MB:
 
   ```sh
   sudo sysctl -w net.core.rmem_max=33554432
@@ -53,7 +115,9 @@ The password is taken from `--password`/`MACSHARE_PASSWORD`, then
 `Save password to keyring? [y/N]` (it is stored only once the Mac accepts it), and `--save-password` saves any working
 password without asking. A stored password the host rejects is removed so the
 next run prompts.
-`--forget-password` deletes the stored entry and exits.
+`--forget-password` deletes the stored entry and exits. Without a working
+keyring nothing offers to save: the terminal question is skipped and the
+dialog hides its checkbox.
 
 Without a terminal (e.g. launched from a `.desktop` file), a missing host,
 user or password is asked for in a small connect dialog instead; the host and
@@ -87,9 +151,10 @@ src/
   rtp/        media transport (pure)
     srtp        SRTP/SRTCP (AES-CM + HMAC-SHA1-80)
     rtcp        RR/SR, FIR/PLI, NACK, LTR acks
+    stats       RFC 3550 receiver statistics (loss, jitter) for RRs
     hevc        RFC 7798 depayloading with DONL
     assembler   access-unit assembly, SSRC → tile mapping
-  video/      libavcodec decoder (bindgen FFI, CUDA or software)
+  video/      libavcodec decoder (bindgen FFI, CUDA, VAAPI or software)
   session/    threads tying it together
     mod         Session handle, shared state, startup
     control     encrypted TCP reader: cursor, layout, clipboard, answers
@@ -109,8 +174,7 @@ frames instead of building a queue.
   silent keepalive.
 - Text-only clipboard. No images or files.
 - IPv4 only. One client per machine, because the media ports are fixed.
-- Only tested by unit tests and interop vectors so far; not yet run against
-  a real Mac.
+- Poor on lossy links; see [Lossy networks](#lossy-networks).
 
 ## Tests
 
@@ -119,13 +183,17 @@ cargo test
 ```
 
 `src/interop_tests.rs` checks byte-for-byte compatibility with vectors
-generated by the iShareScreen reference implementation. A decoder test runs
-real HEVC streams through FFmpeg:
+generated by the iShareScreen reference implementation. Decoder tests run
+real HEVC streams through every backend that opens here and check the
+output matches software decoding. The last two streams are optional; a
+hardware backend must refuse them rather than show garbage:
 
 ```sh
 ffmpeg -f lavfi -i testsrc2=size=1280x720 -frames:v 30 -c:v libx265 -pix_fmt yuv444p -f hevc /tmp/t444.hevc
 ffmpeg -f lavfi -i testsrc2=size=1280x720 -frames:v 30 -c:v libx265 -pix_fmt yuv420p -f hevc /tmp/t420.hevc
-MACSHARE_TEST_HEVC_DIR=/tmp cargo test --release -- --ignored
+ffmpeg -f lavfi -i testsrc2=size=1280x720 -frames:v 30 -c:v libx265 -pix_fmt yuv444p10le -f hevc /tmp/t444p10.hevc
+ffmpeg -f lavfi -i testsrc2=size=8448x256 -frames:v 30 -c:v libx265 -pix_fmt yuv420p -f hevc /tmp/twide.hevc
+MACSHARE_TEST_HEVC_DIR=/tmp cargo test --release -- --ignored --skip bench
 ```
 
 ## Credits

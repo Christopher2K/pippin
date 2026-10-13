@@ -44,8 +44,6 @@ pub struct Options {
     pub size: (u32, u32),
     /// Backing scale to request; `None` follows the window's scale factor.
     pub scale: Option<f64>,
-    /// Fraction of window pixels to stream (see `--render-scale`).
-    pub render_scale: f64,
     pub auto_resize: bool,
     pub swap_ctrl_cmd: bool,
     /// Start a new session when an established one drops.
@@ -106,7 +104,7 @@ impl App {
         let scale = self.opts.scale.unwrap_or(if scale_factor >= 1.5 { 2.0 } else { 1.0 });
         // Same logical size, fewer backing pixels: the Mac lays out as usual
         // and we scale up its smaller picture.
-        let r = self.opts.render_scale;
+        let r = self.cfg.op.lock().render_scale;
         let px = |v: u32| (v as f64 * r).round() as u32;
         DisplayRequest::for_pixels(px(size.width), px(size.height), scale * r)
     }
@@ -330,6 +328,9 @@ impl ApplicationHandler<Tagged> for App {
                 el.exit();
             }
             Event::Lost(reason) => self.session_ended(el, reason, true),
+            // A new render scale: same path as a resize (the host's layout
+            // answer makes the session re-offer).
+            Event::Reconfigure => self.send_resize(),
         }
     }
 

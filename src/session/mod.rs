@@ -11,13 +11,18 @@
 //! * `feedback` sends RTCP (receiver reports, keyframe requests, NACKs, LTR
 //!   acks), the audio keepalive and the cursor poll on a 500 ms tick.
 //! * `clipboard` mirrors text between the local and remote pasteboards.
+//! * `control-fifo` (debug, `MACSHARE_CONTROL_FIFO`) switches the operating
+//!   point mid-session; `stats-json` (`--stats-json`) writes metrics.
 
 mod control;
 mod media;
+mod metrics;
+mod operating;
 
 use std::collections::HashMap;
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream, UdpSocket};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -30,11 +35,13 @@ use parking_lot::Mutex;
 use crate::proto::auth::AuthError;
 use crate::proto::handshake::{self, ConnectParams, SessionMode};
 use crate::proto::messages::{self, DisplayRequest};
-use crate::proto::offers::MediaOffer;
+use crate::proto::offers::{MediaOffer, OfferOptions};
 use crate::proto::record::RecordSealer;
-use crate::video::decoder::Picture;
+use crate::rtp::stats::ReceiverStats;
+use crate::video::decoder::{DecoderKind, Picture};
 
-pub use media::Feedback;
+pub use media::{Feedback, KeyframeCause};
+pub use operating::{AfterLoss, Fps, OperatingPoint, SharedOp};
 
 use crate::errors::Failure;
 
@@ -57,7 +64,9 @@ pub struct Config {
     pub user: String,
     pub password: String,
     pub session_mode: SessionMode,
-    pub hardware_decode: bool,
+    pub decoder: DecoderKind,
+    /// DRM render node for VAAPI; None lets FFmpeg pick.
+    pub vaapi_device: Option<String>,
     /// Software decoder threads; see `DecoderOptions`.
     pub decode_threads: u32,
     /// Present a host frame's tiles together (see `--sync-tiles`).
@@ -70,6 +79,13 @@ pub struct Config {
     /// likely a host still waking up than a firewall, so it's retried
     /// rather than reported as fatal.
     pub resumed: bool,
+    /// The operating point, shared with the window and kept across
+    /// reconnects.
+    pub op: SharedOp,
+    /// Append one JSON line of metrics per second here.
+    pub stats_json: Option<PathBuf>,
+    /// Debug FIFO to read operating-point commands from.
+    pub control_fifo: Option<PathBuf>,
 }
 
 pub type AuthHook = Arc<dyn Fn(bool) + Send + Sync>;
@@ -103,6 +119,9 @@ pub enum Event {
     /// The connection failed or dropped in a way a fresh session may fix
     /// (host asleep, network change, timeout).
     Lost(String),
+    /// The operating point's render scale changed; request the display
+    /// again.
+    Reconfigure,
 }
 
 pub trait EventSink: Send + Sync + 'static {
@@ -143,7 +162,11 @@ impl FrameStore {
 pub struct Control {
     writer: Mutex<(TcpStream, RecordSealer)>,
     record_key: [u8; 16],
-    offer: MediaOffer,
+    /// Our video SSRC, the one our SRs are sent as.
+    video_ssrc: u32,
+    /// The media offer, re-sent after a resize and changed by the
+    /// operating point.
+    offer: Mutex<MediaOffer>,
 }
 
 impl Control {
@@ -156,7 +179,13 @@ impl Control {
     }
 
     pub fn reoffer(&self) {
-        self.send(&self.offer.message());
+        let msg = self.offer.lock().message();
+        self.send(&msg);
+    }
+
+    /// Changes the offer the next [`reoffer`](Self::reoffer) sends.
+    pub fn set_offer_options(&self, opts: OfferOptions) {
+        self.offer.lock().set_options(opts);
     }
 }
 
@@ -183,13 +212,22 @@ pub struct Shared {
     /// When the media session was last re-offered (resize).
     renegotiated: AtomicU64,
     tile_ssrcs: Mutex<Vec<u32>>,
-    extended_seqs: Mutex<HashMap<u32, u32>>,
+    /// RTCP receiver statistics per tile SSRC, for receiver reports.
+    rx_stats: Mutex<HashMap<u32, ReceiverStats>>,
     sender_reports: Mutex<HashMap<u32, (u32, Instant)>>,
+    /// Smoothed round trip from host report blocks echoing our SRs; `None`
+    /// until the host sends one.
+    rtt: Mutex<Option<Duration>>,
+    /// Pictures decoded damaged from access units a hold had recovered,
+    /// since the video receiver last logged it.
+    recovered_damaged: AtomicU32,
     canvas: Mutex<Option<(u32, u32)>>,
     /// The control connection while the handshake runs, for shutdown().
     connecting: Mutex<Option<TcpStream>>,
     /// Clones of the media sockets, so shutdown() can wake their readers.
     udp: Mutex<Vec<UdpSocket>>,
+    op: SharedOp,
+    metrics: metrics::Metrics,
 }
 
 impl Shared {
@@ -203,6 +241,15 @@ impl Shared {
 
     fn touch(&self, stamp: &AtomicU64) {
         stamp.store(self.clock.now_ms(), Ordering::Relaxed);
+    }
+
+    /// The current operating point.
+    fn op(&self) -> OperatingPoint {
+        *self.op.lock()
+    }
+
+    fn op_handle(&self) -> &SharedOp {
+        &self.op
     }
 
     fn set_canvas(&self, w: u32, h: u32) {
@@ -236,11 +283,15 @@ impl Session {
             last_frame: AtomicU64::new(0),
             renegotiated: AtomicU64::new(0),
             tile_ssrcs: Mutex::new(Vec::new()),
-            extended_seqs: Mutex::new(HashMap::new()),
+            rx_stats: Mutex::new(HashMap::new()),
             sender_reports: Mutex::new(HashMap::new()),
+            rtt: Mutex::new(None),
+            recovered_damaged: AtomicU32::new(0),
             canvas: Mutex::new(None),
             connecting: Mutex::new(None),
             udp: Mutex::new(Vec::new()),
+            op: cfg.op.clone(),
+            metrics: metrics::Metrics::default(),
         });
         let threads = Arc::new(Mutex::new(Vec::new()));
         let session = Session { shared: shared.clone(), threads: threads.clone() };
@@ -454,6 +505,7 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
         session_mode: cfg.session_mode,
         display,
         audio: false,
+        offer: shared.op().offer_options(),
         on_open: Some(Box::new({
             let shared = shared.clone();
             move |s: &TcpStream| {
@@ -496,6 +548,7 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
             shared.tiles.store(c.tiles, Ordering::Relaxed);
         }
         shared.set_canvas(c.width, c.height);
+        shared.metrics.set_answer_ltrp(c.ltrp);
     }
     // We write to the host every tick (cursor poll), so a host that went to
     // sleep or a vanished network shows up as unacknowledged data; give up
@@ -506,7 +559,8 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
     let control = Arc::new(Control {
         writer: Mutex::new((neg.stream, neg.sealer)),
         record_key: neg.record_key,
-        offer: neg.offer.clone(),
+        video_ssrc: neg.offer.video_ssrc,
+        offer: Mutex::new(neg.offer.clone()),
     });
     let _ = shared.control.set(control.clone());
     // shutdown() may have run between the check above and the set, seen no
@@ -528,8 +582,9 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
     {
         let (shared, fb) = (shared.clone(), fb_tx.clone());
         let opts = crate::video::decoder::DecoderOptions {
-            prefer_hw: cfg.hardware_decode,
+            kind: cfg.decoder,
             threads: cfg.decode_threads,
+            vaapi_device: cfg.vaapi_device.clone(),
         };
         let sync = cfg.sync_tiles;
         spawn(threads, "decoder", move || media::decoder(shared, dec_rx, fb, opts, sync));
@@ -548,6 +603,14 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
     {
         let (shared, control) = (shared.clone(), control.clone());
         spawn(threads, "clipboard", move || crate::clipboard::run(shared, control, clip_rx));
+    }
+    if let Some(path) = cfg.control_fifo.clone() {
+        let (shared, fb) = (shared.clone(), fb_tx.clone());
+        spawn(threads, "control-fifo", move || operating::control_fifo(shared, path, fb));
+    }
+    if let Some(path) = cfg.stats_json.clone() {
+        let shared = shared.clone();
+        spawn(threads, "stats-json", move || metrics::writer(shared, path));
     }
 
     // Subscribe to pasteboard changes and prime with the current contents.

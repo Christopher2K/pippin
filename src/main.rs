@@ -18,6 +18,7 @@ mod video;
 
 use std::io::{BufRead, IsTerminal};
 use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -25,6 +26,8 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 
 use proto::handshake::SessionMode;
+use rtp::assembler::HoldMode;
+use video::decoder::DecoderKind;
 
 #[derive(Parser)]
 #[command(version, about = "Connect to a Mac's built-in Screen Sharing in high-performance mode")]
@@ -72,15 +75,36 @@ struct Cli {
     /// renders whole scales, so 0.5 needs a Retina (2x) window.
     #[arg(long, default_value_t = 1.0)]
     render_scale: f64,
+    /// Hold frames with missing packets for NACK retransmissions. auto stops
+    /// holding when the host doesn't retransmit.
+    #[arg(long, value_enum, default_value_t = HoldMode::Auto)]
+    hold: HoldMode,
+    /// What to show between a loss and the next keyframe: idr freezes the
+    /// picture (drops everything until the keyframe); conceal keeps decoding
+    /// whatever arrived, so the picture keeps moving but is smeared.
+    #[arg(long, value_enum, default_value_t = session::AfterLoss::Idr)]
+    after_loss: session::AfterLoss,
+    /// Append one JSON line of link and recovery metrics per second to this
+    /// file, for experiments.
+    #[arg(long)]
+    stats_json: Option<PathBuf>,
     /// Keep the remote resolution fixed instead of following the window.
     #[arg(long)]
     no_auto_resize: bool,
     /// Send Ctrl as Command and Super as Control.
     #[arg(long)]
     swap_ctrl_cmd: bool,
-    /// Decode on the CPU even if CUDA is available.
+    /// Video decoder. auto tries CUDA, then VAAPI, then software, and falls
+    /// back further if a hardware decoder can't handle the stream.
+    #[arg(long, value_enum, default_value_t = DecoderKind::Auto)]
+    decoder: DecoderKind,
+    /// Same as --decoder software.
     #[arg(long)]
     no_hw: bool,
+    /// DRM render node for VAAPI decoding, e.g. /dev/dri/renderD129.
+    /// Default: FFmpeg's choice.
+    #[arg(long, env = "MACSHARE_VAAPI_DEVICE")]
+    vaapi_device: Option<String>,
     /// Software decode threads. Pictures are split by CTU row (wavefront),
     /// so more threads add no latency; gains level off around 4-5.
     #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u32).range(1..=16))]
@@ -92,7 +116,8 @@ struct Cli {
     /// Skip the preliminary connection that wakes the host's daemon.
     #[arg(long)]
     no_warmup: bool,
-    /// Exit when the connection drops instead of reconnecting.
+    /// Exit when the connection drops instead of reconnecting. This also
+    /// makes `restart` on the MACSHARE_CONTROL_FIFO exit.
     #[arg(long)]
     no_reconnect: bool,
     /// More logging; repeat for debug output.
@@ -204,7 +229,10 @@ fn run() -> Result<()> {
             let p = rpassword::prompt_password(format!("Password for {u}@{h}: "))?;
             // Asked up front, while the user is at the terminal; the password
             // is only stored once the host accepts it.
-            if !cli.save_password && credentials::confirm_save(&mut std::io::stdin().lock()) {
+            if !cli.save_password
+                && credentials::available(store.as_ref(), &credentials::account(&u, &h, cli.port))
+                && credentials::confirm_save(&mut std::io::stdin().lock())
+            {
                 save = true;
             }
             (h, u, p, credentials::Source::Prompt)
@@ -230,6 +258,11 @@ fn dialog_loop(
     };
     let mut error = None;
     let port = cli.port;
+    // Probed once: the keyring doesn't come and go while the dialog is open.
+    let keyring = credentials::available(store.as_ref(), &credentials::account(&fields.user, &fields.host, port));
+    if !keyring {
+        fields.save = false;
+    }
     let stored = |host: &str, user: &str| match store.get(&credentials::account(user, host, port)) {
         Ok(p) => p,
         Err(e) => {
@@ -242,7 +275,7 @@ fn dialog_loop(
             let store = store.clone();
             move |host: &str, user: &str| matches!(store.get(&credentials::account(user, host, port)), Ok(Some(_)))
         };
-        let Some(f) = ui::dialog::run(event_loop, fields.clone(), error.take(), has_saved)? else {
+        let Some(f) = ui::dialog::run(event_loop, fields.clone(), error.take(), keyring, has_saved)? else {
             return Ok(());
         };
         let Some((password, source)) = credentials::dialog_password(f.password.clone(), || stored(&f.host, &f.user))
@@ -313,19 +346,34 @@ fn connect(
         user: user.to_owned(),
         password: password.clone(),
         session_mode: cli.session,
-        hardware_decode: !cli.no_hw,
+        decoder: if cli.no_hw { DecoderKind::Software } else { cli.decoder },
+        vaapi_device: cli.vaapi_device.clone(),
         decode_threads: cli.decode_threads,
         sync_tiles: cli.sync_tiles,
         warmup: !cli.no_warmup,
         on_auth: Some(on_auth),
         resumed: false,
+        op: Arc::new(parking_lot::Mutex::new(session::OperatingPoint {
+            render_scale: cli.render_scale,
+            // Frame rate, keyframe request kind and LTR are experiment
+            // knobs on the control FIFO only; none made a measurable
+            // difference on a lossy link, as the Mac doesn't retransmit.
+            fps: session::Fps::Sixty,
+            recovery: rtp::rtcp::Recovery::FirPli,
+            hold: cli.hold,
+            ltr: true,
+            after_loss: cli.after_loss,
+        })),
+        stats_json: cli.stats_json.clone(),
+        // Debug only: switch operating-point levers mid-session by writing
+        // lines such as `fps 30` or `hold off` to this FIFO.
+        control_fifo: std::env::var_os("MACSHARE_CONTROL_FIFO").map(PathBuf::from),
     };
     let opts = ui::Options {
         title: format!("{host_name} — macshare"),
         host_name: host_name.to_owned(),
         size: cli.size,
         scale: cli.scale,
-        render_scale: cli.render_scale,
         auto_resize: !cli.no_auto_resize,
         swap_ctrl_cmd: cli.swap_ctrl_cmd,
         reconnect: !cli.no_reconnect,

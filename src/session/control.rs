@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 use anyhow::Result;
 use crossbeam_channel::Sender;
 
-use super::{Control, CursorShape, Event, Feedback, Shared};
+use super::{Control, CursorShape, Event, Feedback, KeyframeCause, Shared};
 use crate::proto::clipboard::{self, Reassembler};
 use crate::proto::messages::{self, CursorRect, DisplayLayout, Rect};
 use crate::proto::offers::parse_answer;
@@ -137,6 +137,7 @@ impl ControlReader {
                             self.shared.tiles.store(c.tiles, Ordering::Relaxed);
                         }
                         self.shared.set_canvas(c.width, c.height);
+                        self.shared.metrics.set_answer_ltrp(c.ltrp);
                     }
                 }
                 Rect::RecordKeys(k) => tracing::debug!("ignoring late record-key rect ({} bytes)", k.len()),
@@ -204,7 +205,7 @@ impl ControlReader {
             tracing::info!("geometry changed; re-offering media session");
             self.shared.touch(&self.shared.renegotiated);
             self.control.reoffer();
-            let _ = self.feedback.send(Feedback::Keyframe(None));
+            let _ = self.feedback.send(Feedback::Keyframe(None, KeyframeCause::Reoffer));
         }
         self.shared.set_canvas(l.backing.0 as u32, l.backing.1 as u32);
     }
