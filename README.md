@@ -39,8 +39,10 @@ client window.
 ## Experiments
 
 `--stats-json stats.jsonl` appends one JSON object per second: the
-operating point, packet and byte rates, per-tile loss and jitter, NACKs,
-holds, keyframe requests by kind, keyframe sizes, recovery latency, frozen
+operating point and what the host answered (canvas, LTR, per-tile picture
+rate), packet and byte rates, per-tile loss before and after repair and
+jitter, NACKs and how fast retransmissions arrive, holds, keyframe requests
+by kind and by cause, keyframe sizes, recovery time per loss outage, frozen
 time, decode times, presented frames and round trip. Each field is
 documented in `src/session/metrics.rs`.
 
@@ -49,7 +51,8 @@ For switching levers mid-session without a GUI, set
 write commands to it, e.g. `echo 'hold off' > /tmp/macshare.ctl`:
 `render_scale 1|0.5`, `fps 60|30`, `recovery fir|pli|fir+pli`,
 `hold auto|on|off`, `ltr on|off`, `keyframe` (ask for one now) and
-`restart` (reconnect with the current settings). `recovery` and `hold`
+`restart` (reconnect with the current settings; with `--no-reconnect` it
+exits instead). `recovery` and `hold`
 apply at once; `render_scale` re-requests the display like a resize; `fps`
 and `ltr` re-offer the media session on the open connection.
 

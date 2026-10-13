@@ -29,6 +29,13 @@ const AVC_PARAMS: &[u8] = b"FLS;LF:-1;POS:5;EOD:1;HTS:2;RR:3;POSE:4;AR:16/9,5/8;
 /// "60 fps supported" for video stream 1 and stream 2; with both clear the
 /// host is expected to encode at 30 fps (unverified). The daemon forces both
 /// on for message version <= 1; we send version 3, so clearing them sticks.
+///
+/// The word is written big-endian although the host reads it raw: it
+/// forwards the value to the streaming agent, which tests the bits after the
+/// IPC boundary has byte-swapped it, so big-endian is what arrives. The
+/// reference found this the hard way (negotiation.py:194-204): big-endian
+/// `00 00 00 07` makes the host honour the no-cursor bit, little-endian
+/// leaves the cursor baked into the video. The fps bits travel the same way.
 const FLAG_60FPS_STREAM1: u32 = 1;
 const FLAG_60FPS_STREAM2: u32 = 2;
 /// The host draws no cursor into the video; we show its shapes locally.
@@ -364,6 +371,8 @@ pub struct CanvasInfo {
     pub width: u32,
     pub height: u32,
     pub tiles: u32,
+    /// ltrpEnabled (field 7) as answered, if present.
+    pub ltrp: Option<bool>,
 }
 
 /// Finds the length of a binary plist starting at `buf[0]` by locating a
@@ -409,13 +418,14 @@ pub fn parse_answer(data: &[u8]) -> Option<CanvasInfo> {
         }
         for (field, value) in PbReader::new(&raw) {
             let (5, PbValue::Bytes(video)) = (field, value) else { continue };
-            let mut c = CanvasInfo { width: 0, height: 0, tiles: 0 };
+            let mut c = CanvasInfo { width: 0, height: 0, tiles: 0, ltrp: None };
             for (f, v) in PbReader::new(video) {
                 if let PbValue::Int(v) = v {
                     match f {
                         4 => c.width = v as u32,
                         5 => c.height = v as u32,
                         6 => c.tiles = v as u32,
+                        7 => c.ltrp = Some(v != 0),
                         _ => {}
                     }
                 }
@@ -459,7 +469,7 @@ mod tests {
     #[test]
     fn answer_round_trip() {
         // Build an "answer" shaped like ours but with canvas fields filled in.
-        let d = Pb::default().int(1, 5).int(4, 2560).int(5, 1440).int(6, 4).0;
+        let d = Pb::default().int(1, 5).int(4, 2560).int(5, 1440).int(6, 4).int(7, 0).0;
         let blob = Pb::default().int(1, 1).bytes(5, &d).0;
         let mut dict = plist::Dictionary::new();
         dict.insert("avcMediaStreamNegotiatorMediaBlob".into(), plist::Value::Data(zlib(&blob)));
@@ -468,7 +478,7 @@ mod tests {
         let mut msg = vec![0u8, 0, 0, 1, 0xde, 0xad];
         msg.extend_from_slice(&pl);
         msg.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9]);
-        assert_eq!(parse_answer(&msg), Some(CanvasInfo { width: 2560, height: 1440, tiles: 4 }));
+        assert_eq!(parse_answer(&msg), Some(CanvasInfo { width: 2560, height: 1440, tiles: 4, ltrp: Some(false) }));
     }
 
     #[test]

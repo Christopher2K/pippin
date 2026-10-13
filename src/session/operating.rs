@@ -27,7 +27,7 @@ use std::sync::Arc;
 use crossbeam_channel::Sender;
 use parking_lot::Mutex;
 
-use super::{Event, Feedback, Shared};
+use super::{Event, Feedback, KeyframeCause, Shared};
 use crate::proto::offers::OfferOptions;
 use crate::rtp::assembler::HoldMode;
 use crate::rtp::rtcp::Recovery;
@@ -131,7 +131,8 @@ pub fn parse_on_off(s: &str) -> Result<bool, String> {
 
 /// Parses a control line: `render_scale 1|0.5`, `fps 60|30`,
 /// `recovery fir|pli|fir+pli`, `hold auto|on|off`, `ltr on|off`,
-/// `keyframe` or `restart`. Blank lines and `#` comments give `Ok(None)`.
+/// `keyframe` or `restart` (which ends the session like a dropped connection,
+/// so it exits under `--no-reconnect`). Blank lines and `#` comments give `Ok(None)`.
 pub fn parse_command(line: &str) -> Result<Option<Command>, String> {
     let line = line.split('#').next().unwrap_or_default().trim();
     let mut words = line.split_whitespace();
@@ -188,7 +189,7 @@ pub(super) fn apply(shared: &Shared, fb: &Sender<Feedback>, new: OperatingPoint)
         c.set_offer_options(new.offer_options());
         shared.touch(&shared.renegotiated);
         c.reoffer();
-        let _ = fb.send(Feedback::Keyframe(None));
+        let _ = fb.send(Feedback::Keyframe(None, KeyframeCause::Reoffer));
     }
 }
 
@@ -201,7 +202,7 @@ fn run_command(shared: &Shared, fb: &Sender<Feedback>, cmd: Command) {
         }
         Command::Keyframe => {
             tracing::info!("control: keyframe requested");
-            let _ = fb.send(Feedback::Keyframe(None));
+            let _ = fb.send(Feedback::Keyframe(None, KeyframeCause::Other));
         }
         Command::Restart => {
             tracing::info!("control: restarting the session");

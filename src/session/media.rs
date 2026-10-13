@@ -18,10 +18,64 @@ use crate::rtp::stats::{ReceiverStats, VIDEO_CLOCK_HZ};
 use crate::rtp::{hevc, rtcp};
 use crate::video::decoder::{self, Decoder, DecoderOptions, Picture};
 
+/// Why a keyframe was requested, so the metrics can keep loss recovery
+/// apart from requests that are part of a renegotiation or a watchdog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyframeCause {
+    /// An access unit came out incomplete (lost packets, hold given up).
+    Gap,
+    /// The decoder rejected an access unit.
+    DecodeError,
+    /// A picture decoded with missing references.
+    Damaged,
+    /// A new SSRC group was adopted.
+    Adoption,
+    /// The media session was re-offered (resize, operating point).
+    Reoffer,
+    /// Packets arrive but no pictures come out.
+    Stall,
+    /// Switched to the next decoder backend.
+    HwFallback,
+    /// A keyframe arrived without parameter sets, or one was asked for on
+    /// the control FIFO.
+    Other,
+}
+
+impl KeyframeCause {
+    pub const ALL: [KeyframeCause; 8] = [
+        KeyframeCause::Gap,
+        KeyframeCause::DecodeError,
+        KeyframeCause::Damaged,
+        KeyframeCause::Adoption,
+        KeyframeCause::Reoffer,
+        KeyframeCause::Stall,
+        KeyframeCause::HwFallback,
+        KeyframeCause::Other,
+    ];
+
+    /// Caused by loss on the link: what loss recovery is measured on.
+    pub fn is_loss(self) -> bool {
+        matches!(self, KeyframeCause::Gap | KeyframeCause::DecodeError | KeyframeCause::Damaged)
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            KeyframeCause::Gap => "gap",
+            KeyframeCause::DecodeError => "decode",
+            KeyframeCause::Damaged => "damaged",
+            KeyframeCause::Adoption => "adoption",
+            KeyframeCause::Reoffer => "reoffer",
+            KeyframeCause::Stall => "stall",
+            KeyframeCause::HwFallback => "hw_fallback",
+            KeyframeCause::Other => "other",
+        }
+    }
+}
+
 /// Requests from the media threads to the feedback sender.
 pub enum Feedback {
     /// Ask for an IDR on one tile, or on every tile.
-    Keyframe(Option<usize>),
+    Keyframe(Option<usize>, KeyframeCause),
     /// Retransmission request: media SSRC and lost sequence numbers.
     Nack(u32, Vec<u16>),
     /// The base tile decoded cleanly up to this DONL.
@@ -135,6 +189,39 @@ fn retry_nacks(
     n
 }
 
+/// How long a NACKed packet is watched for, for the metrics and the hold
+/// policy: well past any hold, so a host that retransmits late is told
+/// apart from one that never does.
+const NACK_WATCH: Duration = Duration::from_secs(1);
+const NACK_WATCH_MAX: usize = 8192;
+
+/// NACKed packets and when they were first NACKed, kept apart from the
+/// hold's retry bookkeeping (which forgets them when the hold ends).
+#[derive(Default)]
+struct NackWatch {
+    sent: HashMap<(u32, u16), Instant>,
+}
+
+impl NackWatch {
+    fn nacked(&mut self, ssrc: u32, lost: &[u16], now: Instant) {
+        for &seq in lost {
+            if self.sent.len() >= NACK_WATCH_MAX {
+                break;
+            }
+            self.sent.entry((ssrc, seq)).or_insert(now);
+        }
+    }
+
+    /// How long ago a packet that just arrived was first NACKed, if it was.
+    fn arrived(&mut self, ssrc: u32, seq: u16, now: Instant) -> Option<Duration> {
+        self.sent.remove(&(ssrc, seq)).map(|t| now.saturating_duration_since(t))
+    }
+
+    fn expire(&mut self, now: Instant) {
+        self.sent.retain(|_, t| now.saturating_duration_since(*t) < NACK_WATCH);
+    }
+}
+
 /// Loss recovery in the video receiver, logged every STATS_EVERY at debug
 /// level so the hold can be tuned against a real host.
 struct LossStats {
@@ -199,6 +286,9 @@ pub(super) fn video_rx(
     let mut next_seq: HashMap<u32, u16> = HashMap::new();
     // NACKed packets not yet seen: when first requested, and whether retried.
     let mut nacked: HashMap<(u32, u16), (Instant, bool)> = HashMap::new();
+    let mut watch = NackWatch::default();
+    // Latest RTP timestamp per tile SSRC, to count the pictures sent.
+    let mut last_ts: HashMap<u32, u32> = HashMap::new();
     let mut buf = vec![0u8; 65536];
     let mut last_evict = Instant::now();
     let mut polling = false;
@@ -226,25 +316,35 @@ pub(super) fn video_rx(
                     }
                     tiles.count_packet(p.ssrc);
                     if let Some(tile) = tiles.tile_of(p.ssrc) {
+                        let now = Instant::now();
                         shared.metrics.tile_packet(tile, shared.clock.now_ms());
-                        // Gap detection for NACKs; the assembler deals with order.
-                        if nacked.remove(&(p.ssrc, p.seq)).is_some() {
+                        // A newer RTP timestamp is a new picture from the host.
+                        let newer = last_ts.get(&p.ssrc).is_none_or(|&t| (1..0x8000_0000).contains(&p.ts.wrapping_sub(t)));
+                        if newer {
+                            last_ts.insert(p.ssrc, p.ts);
+                            shared.metrics.tile_frame(tile);
+                        }
+                        nacked.remove(&(p.ssrc, p.seq));
+                        if let Some(after) = watch.arrived(p.ssrc, p.seq, now) {
                             // A retransmission, or a late original: either
-                            // way a hold could have been filled.
-                            shared.metrics.nacked_arrived.fetch_add(1, Ordering::Relaxed);
+                            // way a long enough hold would have been filled.
+                            shared.metrics.nack_arrived(after);
                             asm.nacked_arrived();
                         }
+                        // Gap detection for NACKs; the assembler deals with order.
                         let expected = *next_seq.entry(p.ssrc).or_insert(p.seq);
                         let gap = p.seq.wrapping_sub(expected);
                         if gap < 0x8000 {
+                            // Holes as first seen, before any repair.
+                            shared.metrics.tile_holes(tile, gap as u64);
                             if gap > 0 && gap < NACK_MAX_GAP {
                                 let lost: Vec<u16> = (0..gap).map(|i| expected.wrapping_add(i)).collect();
                                 loss.nacked += lost.len() as u32;
                                 shared.metrics.nacked.fetch_add(lost.len() as u64, Ordering::Relaxed);
                                 if nacked.len() < NACK_PENDING_MAX {
-                                    let now = Instant::now();
                                     nacked.extend(lost.iter().map(|&s| ((p.ssrc, s), (now, false))));
                                 }
+                                watch.nacked(p.ssrc, &lost, now);
                                 let _ = fb.send(Feedback::Nack(p.ssrc, lost));
                             }
                             next_seq.insert(p.ssrc, p.seq.wrapping_add(1));
@@ -288,6 +388,7 @@ pub(super) fn video_rx(
                 return;
             }
             let retried = retry_nacks(&mut nacked, asm.retry_after(), asm.wait(), now, &fb);
+            watch.expire(now);
             loss.retried += retried;
             shared.metrics.nack_retries.fetch_add(retried as u64, Ordering::Relaxed);
             let holds = asm.take_stats();
@@ -316,6 +417,8 @@ pub(super) fn video_rx(
                 srtp.forget(|s| ssrcs.contains(&s));
                 next_seq.clear();
                 nacked.clear();
+                watch = NackWatch::default();
+                last_ts.clear();
                 *shared.tile_ssrcs.lock() = ssrcs;
                 shared.rx_stats.lock().clear();
                 shared.renegotiated.store(0, Ordering::Relaxed);
@@ -325,7 +428,7 @@ pub(super) fn video_rx(
                 for (tile, au) in backlog {
                     let _ = dec.send(DecoderMsg::Au { tile, au });
                 }
-                let _ = fb.send(Feedback::Keyframe(None));
+                let _ = fb.send(Feedback::Keyframe(None, KeyframeCause::Adoption));
             }
         }
     }
@@ -419,8 +522,15 @@ struct DecodeLoop {
     /// tiles would never clear.
     awaiting_idr: bool,
     pts: i64,
-    /// Tile, DONL and whether a hold recovered it, per decoder input.
-    origin: HashMap<i64, (usize, Option<u16>, bool)>,
+    /// Tile, DONL, whether a hold recovered it and the IRAP epoch, per
+    /// decoder input.
+    origin: HashMap<i64, (usize, Option<u16>, bool, u64)>,
+    /// IRAPs fed to the decoder so far: a picture from a later epoch than a
+    /// loss comes after the keyframe that repaired it.
+    epoch: u64,
+    /// Tiles whose first access unit after the latest IRAP is still to come
+    /// (a bit per tile); its size is part of what the keyframe cost.
+    irap_follow: u32,
     fed_without_output: Option<u32>,
     /// No backend could be reopened; the session has been closed.
     dead: bool,
@@ -573,17 +683,21 @@ impl DecodeLoop {
         }
         if !au.complete {
             self.awaiting_idr = true;
-            let _ = self.fb.send(Feedback::Keyframe(Some(tile)));
+            self.loss_keyframe(tile, self.epoch, KeyframeCause::Gap);
             return;
         }
         if !au.nalus.iter().any(|n| hevc::is_slice(n)) {
             return;
         }
         let irap = au.nalus.iter().any(|n| hevc::is_irap(n));
+        let bytes: u64 = au.nalus.iter().map(|n| n.len() as u64).sum();
+        let m = &self.shared.metrics;
         if irap {
-            let m = &self.shared.metrics;
             m.irap_aus.fetch_add(1, Ordering::Relaxed);
-            m.irap_bytes.fetch_add(au.nalus.iter().map(|n| n.len() as u64).sum(), Ordering::Relaxed);
+            m.irap_bytes.fetch_add(bytes, Ordering::Relaxed);
+        } else if tile < 32 && self.irap_follow & (1 << tile) != 0 {
+            self.irap_follow &= !(1 << tile);
+            m.irap_follow_bytes.fetch_add(bytes, Ordering::Relaxed);
         }
         if self.awaiting_idr && !irap {
             return;
@@ -592,7 +706,7 @@ impl DecodeLoop {
         if irap {
             if self.params.sps.is_none() || self.params.pps.is_empty() {
                 // A keyframe without parameter sets cannot start the decoder.
-                let _ = self.fb.send(Feedback::Keyframe(Some(tile)));
+                let _ = self.fb.send(Feedback::Keyframe(Some(tile), KeyframeCause::Other));
                 return;
             }
             if self.active_sps.is_some() && self.active_sps != self.params.sps {
@@ -601,6 +715,8 @@ impl DecodeLoop {
             }
             self.active_sps = self.params.sps.clone();
             self.awaiting_idr = false;
+            self.epoch += 1;
+            self.irap_follow = follow_mask(self.shared.tiles.load(Ordering::Relaxed) as usize, tile);
             self.params.write(&mut annexb);
         }
         for nal in au.nalus.iter().filter(|n| !(irap && hevc::is_param_set(n))) {
@@ -608,7 +724,7 @@ impl DecodeLoop {
         }
 
         self.pts += 1;
-        self.origin.insert(self.pts, (tile, au.donl, au.recovered));
+        self.origin.insert(self.pts, (tile, au.donl, au.recovered, self.epoch));
         let mut pictures = Vec::new();
         if let Some(d) = self.dump.as_mut() {
             let _ = std::io::Write::write_all(d, &annexb);
@@ -621,7 +737,7 @@ impl DecodeLoop {
         self.shared.metrics.decoded(took);
         if !ok {
             self.awaiting_idr = true;
-            let _ = self.fb.send(Feedback::Keyframe(Some(tile)));
+            self.loss_keyframe(tile, self.epoch, KeyframeCause::DecodeError);
         }
         let floor = self.pts - 256;
         self.origin.retain(|&p, _| p > floor);
@@ -644,7 +760,7 @@ impl DecodeLoop {
             self.batch.clear();
             self.batch_started = None;
             self.restart(true);
-            let _ = self.fb.send(Feedback::Keyframe(None));
+            let _ = self.fb.send(Feedback::Keyframe(None, KeyframeCause::HwFallback));
             return;
         }
         for p in pictures {
@@ -653,15 +769,17 @@ impl DecodeLoop {
     }
 
     fn publish(&mut self, pic: Picture) {
-        let Some((tile, donl, recovered)) = self.origin.remove(&pic.pts) else {
+        let Some((tile, donl, recovered, epoch)) = self.origin.remove(&pic.pts) else {
             return;
         };
-        self.shared.metrics.picture(tile, !pic.damaged, self.shared.clock.now_ms(), Instant::now());
+        self.shared.metrics.picture(tile, epoch, self.shared.clock.now_ms(), Instant::now());
         if pic.damaged {
             if recovered {
                 self.shared.recovered_damaged.fetch_add(1, Ordering::Relaxed);
             }
-            let _ = self.fb.send(Feedback::Keyframe(Some(tile)));
+            // Repaired by the next IRAP after this picture's, not by the
+            // next clean P picture (it may still reference the damage).
+            self.loss_keyframe(tile, epoch, KeyframeCause::Damaged);
         } else if let (0, Some(d)) = (tile, donl) {
             let _ = self.fb.send(Feedback::LtrAck(d));
         }
@@ -675,6 +793,14 @@ impl DecodeLoop {
         if !self.sync_tiles || self.batch.len() >= self.shared.tiles.load(Ordering::Relaxed) as usize {
             self.flush(Flush::Complete);
         }
+    }
+
+    /// Asks for a keyframe after a loss seen in IRAP epoch `epoch`; the
+    /// first such request opens an outage for the recovery metrics, which
+    /// the first picture of a later epoch closes.
+    fn loss_keyframe(&mut self, tile: usize, epoch: u64, cause: KeyframeCause) {
+        self.shared.metrics.outage(epoch, Instant::now());
+        let _ = self.fb.send(Feedback::Keyframe(Some(tile), cause));
     }
 
     fn flush(&mut self, why: Flush) {
@@ -703,6 +829,12 @@ impl DecodeLoop {
     }
 }
 
+/// The tiles other than `irap_tile` out of `tiles`, as a bit mask.
+fn follow_mask(tiles: usize, irap_tile: usize) -> u32 {
+    let all = if tiles >= 32 { u32::MAX } else { (1u32 << tiles) - 1 };
+    all & !1u32.checked_shl(irap_tile as u32).unwrap_or(0)
+}
+
 pub(super) fn decoder(shared: Arc<Shared>, rx: Receiver<DecoderMsg>, fb: Sender<Feedback>, opts: DecoderOptions, sync_tiles: bool) {
     let decoder = match Decoder::new(&opts) {
         Ok(d) => d,
@@ -723,6 +855,8 @@ pub(super) fn decoder(shared: Arc<Shared>, rx: Receiver<DecoderMsg>, fb: Sender<
         awaiting_idr: true,
         pts: 0,
         origin: HashMap::new(),
+        epoch: 0,
+        irap_follow: 0,
         fed_without_output: hw.then_some(0),
         batch: Vec::new(),
         sync_tiles,
@@ -743,6 +877,10 @@ pub(super) fn decoder(shared: Arc<Shared>, rx: Receiver<DecoderMsg>, fb: Sender<
                 }
             }
             Ok(DecoderMsg::Reset) => {
+                // A new stream: an open outage belongs to the old one, and
+                // its recovery would be the adoption's.
+                shared.metrics.end_outage();
+                st.irap_follow = 0;
                 st.batch.clear();
                 st.batch_started = None;
                 // New SSRC group: new parameter sets will follow.
@@ -827,7 +965,7 @@ impl FeedbackSender {
         }
     }
 
-    fn keyframe(&mut self, tile: Option<usize>) {
+    fn keyframe(&mut self, tile: Option<usize>, cause: KeyframeCause) {
         let ssrcs = self.shared.tile_ssrcs.lock().clone();
         let targets: Vec<usize> = match tile {
             Some(t) => vec![t],
@@ -836,7 +974,8 @@ impl FeedbackSender {
         let shared = self.shared.clone();
         let metrics = &shared.metrics;
         if self.shared.since_ms(&self.shared.last_video_packet) > IDLE_AFTER_MS {
-            metrics.keyframes_suppressed.fetch_add(targets.len() as u64, Ordering::Relaxed);
+            let n = targets.iter().filter(|&&t| t < ssrcs.len()).count();
+            metrics.keyframes_suppressed.fetch_add(n as u64, Ordering::Relaxed);
             return;
         }
         let kind = self.shared.op().recovery;
@@ -849,16 +988,16 @@ impl FeedbackSender {
             }
             self.last_keyframe.insert(t, now);
             self.fir_seq = self.fir_seq.wrapping_add(1);
-            tracing::debug!("keyframe request ({}) for tile {t}", kind.name());
+            tracing::debug!("keyframe request ({}, {}) for tile {t}", kind.name(), cause.name());
             let pkt = rtcp::recovery_request(kind, self.our_ssrc, target, self.fir_seq);
             self.ctrl(&pkt);
-            metrics.keyframe_sent(kind, t, now);
+            metrics.keyframe_sent(kind, cause);
         }
     }
 
     fn handle(&mut self, msg: Feedback) {
         match msg {
-            Feedback::Keyframe(t) => self.keyframe(t),
+            Feedback::Keyframe(t, cause) => self.keyframe(t, cause),
             Feedback::Nack(ssrc, lost) => {
                 if let Some(pkt) = rtcp::nack(self.our_ssrc, ssrc, &lost) {
                     self.ctrl(&pkt);
@@ -931,7 +1070,7 @@ impl FeedbackSender {
         if self.last_stall_keyframe.is_none_or(|t| t.elapsed() >= STALL_KEYFRAME_EVERY) {
             tracing::debug!("no picture for {stalled} ms; requesting keyframes");
             self.last_stall_keyframe = Some(Instant::now());
-            self.keyframe(None);
+            self.keyframe(None, KeyframeCause::Stall);
         }
         if stalled > STALL_RESET_MS && !self.stall_reset_done {
             tracing::warn!("video stalled for {} s; resetting decoder", stalled / 1000);
@@ -982,6 +1121,32 @@ pub(super) fn feedback(
 mod tests {
     use super::*;
     use crate::rtp::srtp::RtpPacket;
+
+    #[test]
+    fn nack_watch_outlives_holds() {
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        let mut w = NackWatch::default();
+        w.nacked(1, &[5, 6], t0);
+        // NACKed again later: the latency counts from the first NACK.
+        w.nacked(1, &[6], ms(50));
+        assert_eq!(w.arrived(1, 6, ms(400)), Some(Duration::from_millis(400)));
+        assert_eq!(w.arrived(1, 6, ms(410)), None);
+        assert_eq!(w.arrived(2, 5, ms(410)), None);
+        w.expire(ms(999));
+        assert_eq!(w.arrived(1, 5, ms(999)), Some(Duration::from_millis(999)));
+        w.nacked(1, &[7], t0);
+        w.expire(ms(1000));
+        assert_eq!(w.arrived(1, 7, ms(1000)), None);
+    }
+
+    #[test]
+    fn irap_follow_mask() {
+        assert_eq!(follow_mask(4, 0), 0b1110);
+        assert_eq!(follow_mask(4, 2), 0b1011);
+        assert_eq!(follow_mask(1, 0), 0);
+        assert_eq!(follow_mask(40, 33), u32::MAX);
+    }
 
     #[test]
     fn retries_each_missing_packet_once() {

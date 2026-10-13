@@ -13,35 +13,63 @@
 //!   (fir, pli or fir+pli), `hold` (the mode: auto, on, off), `holding`
 //!   (whether access units with gaps are held right now; auto can switch
 //!   it off), `ltr` (LTR offered and acked).
-//! * `video_pps`, `video_bytes_ps`: authenticated video RTP packets and
-//!   their UDP payload bytes, every SSRC (including ones not adopted).
+//! * What the host settled on: `canvas` (`[width, height]` of the encoded
+//!   canvas, from its answer or the latest display layout; null before
+//!   either), `answer_ltrp` (ltrpEnabled in the host's latest answer; null
+//!   if it had none), `max_tile_fps` (the highest of the tiles' `fps`).
+//! * `video_pps`, `video_bytes_ps`: authenticated video SRTP packets and
+//!   their size as received, every SSRC (including ones not adopted). The
+//!   size is the UDP payload: RTP header, encrypted payload and SRTP auth
+//!   tag, without IP and UDP headers. Undecryptable packets are left out.
 //! * `tiles`: per adopted tile, `loss_pct` (packets missing over packets
 //!   expected in the interval, from the RFC 3550 receiver statistics; a
-//!   retransmission or late packet that fills a hole counts as received)
-//!   and `jitter_ms` (RFC 3550 interarrival jitter at the end).
+//!   retransmission or late packet that fills a hole counts as received,
+//!   so this is the loss left after repair), `loss_pre_pct` (sequence
+//!   number holes as first seen over packets expected: the loss before any
+//!   repair; a reordered packet counts as a hole too), `jitter_ms` (RFC
+//!   3550 interarrival jitter at the end) and `fps` (distinct RTP
+//!   timestamps per second: the pictures the host sent for that tile,
+//!   whether or not they arrived whole).
 //! * `nacks`: packets NACKed for the first time; `nack_retries`: packets
 //!   NACKed a second time; `nacked_arrived`: NACKed packets that arrived
-//!   after all within the hold window (retransmissions, or late originals).
-//!   Zero here with `nacks` > 0 means the host isn't retransmitting.
+//!   within 1 s of their first NACK (retransmissions, or late originals),
+//!   whether or not a hold was still waiting for them. Zero here with
+//!   `nacks` > 0 means the host isn't retransmitting.
+//!   `nack_arrival_p50_ms`, `nack_arrival_max_ms`: time from the first NACK
+//!   to the arrival, over those packets; null when none arrived.
 //! * `holds_started`, `holds_filled`, `holds_given_up`: access units held
 //!   for missing packets, and how those holds ended.
-//! * `kf_fir`, `kf_pli`, `kf_fir_pli`: keyframe requests sent, by the kind
-//!   sent (one per tile request). `kf_suppressed`: requests not sent because
-//!   the same tile was asked within 500 ms or the stream was idle.
+//! * Keyframe requests sent, one per tile request. By kind, for the ones
+//!   caused by loss only: `kf_loss_fir`, `kf_loss_pli`, `kf_loss_fir_pli`.
+//!   By cause, all of them: `kf_gap` (an access unit came out incomplete),
+//!   `kf_decode` (the decoder rejected one), `kf_damaged` (a picture decoded
+//!   with missing references) are the loss causes; `kf_adoption` (a new
+//!   SSRC group), `kf_reoffer` (resize or operating point change),
+//!   `kf_stall` (packets but no pictures; repeated every 1.5 s),
+//!   `kf_hw_fallback` (switched decoder backend) and `kf_other` (a keyframe
+//!   without parameter sets, or `keyframe` on the control FIFO) are not.
+//!   `kf_suppressed`: tile requests not sent because the same tile was
+//!   asked within 500 ms or the stream was idle.
 //! * `irap_aus`, `irap_bytes`: complete IRAP (keyframe) access units that
 //!   reached the decoder, and their total size (NAL units, no start codes).
-//!   Keyframes lost in transit are not counted.
-//! * `recovery_n`, `recovery_p50_ms`, `recovery_max_ms`: for each keyframe
-//!   request sent, the time until the next undamaged picture on that tile;
-//!   samples are taken when that picture arrives, so they belong to the
-//!   interval it arrived in. Requests sent again before recovering each give
-//!   a sample, so the max is the first request's (the whole outage). Null
-//!   when no request completed in the interval.
+//!   Keyframes lost in transit are not counted. `irap_follow_bytes`: the
+//!   size of the first access unit on each of the other tiles after an
+//!   IRAP (the host's IDR covers the base tile only; the rest follow).
+//! * `recovery_n`, `recovery_p50_ms`, `recovery_max_ms`: outages caused by
+//!   loss and how long they lasted. An outage starts with the first loss
+//!   keyframe request (gap, decode, damaged) while none is open; requests
+//!   repeated during it add nothing. It ends with the first picture, of any
+//!   tile, decoded from an IRAP fed after the loss or from what followed
+//!   it: a clean P picture that may still reference the damage doesn't end
+//!   it. Adopting a new SSRC group drops an open outage without a sample.
+//!   Samples belong to the interval the outage ended in. Null when none
+//!   ended in the interval.
 //! * `frozen_ms`: time in the interval, sampled every 10 ms, during which
 //!   the picture was stuck: the decoder was dropping everything while
-//!   waiting for a keyframe and video arrived in the last 1.5 s, or a tile
-//!   received packets in the last 100 ms but produced no picture for
-//!   100 ms.
+//!   waiting for a keyframe and video arrived in the last 1.5 s, or some
+//!   tile received packets in the last 100 ms but produced no picture for
+//!   100 ms. A static screen, where the host sends nothing, is not frozen.
+//!   It measures the decode side; a slow renderer doesn't show here.
 //! * `decode_aus`, `decode_avg_ms`, `decode_worst_ms`: access units fed to
 //!   the decoder and how long the decode call took.
 //! * `presented_fps`: frames handed to the renderer (a frame is one tile
@@ -55,12 +83,12 @@ use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
 
-use super::Shared;
+use super::{KeyframeCause, Shared};
 use crate::rtp::assembler::HoldStats;
 use crate::rtp::rtcp::Recovery;
 use crate::rtp::stats::VIDEO_CLOCK_HZ;
@@ -73,7 +101,7 @@ const SAMPLE_EVERY: Duration = Duration::from_millis(10);
 const FROZEN_AFTER_MS: u64 = 100;
 /// Waiting for a keyframe counts as frozen only while video flows.
 const FLOWING_MS: u64 = 1500;
-/// Recovery samples kept between lines at most.
+/// Latency samples kept between lines at most.
 const MAX_SAMPLES: usize = 4096;
 
 /// Shared counters. Monotonic ones are swapped to zero by the stats writer,
@@ -84,24 +112,33 @@ pub(super) struct Metrics {
     pub video_bytes: AtomicU64,
     pub nacked: AtomicU64,
     pub nack_retries: AtomicU64,
-    pub nacked_arrived: AtomicU64,
+    nacked_arrived: AtomicU64,
+    nack_latency: Mutex<Vec<Duration>>,
     pub holds_started: AtomicU64,
     pub holds_filled: AtomicU64,
     pub holds_given_up: AtomicU64,
     pub holding: AtomicBool,
-    keyframes: [AtomicU64; 3],
+    /// Loss-caused requests by kind, and all requests by cause.
+    kf_loss: [AtomicU64; 3],
+    kf_cause: [AtomicU64; KeyframeCause::ALL.len()],
     pub keyframes_suppressed: AtomicU64,
     pub irap_aus: AtomicU64,
     pub irap_bytes: AtomicU64,
+    pub irap_follow_bytes: AtomicU64,
     pub decoded_aus: AtomicU64,
     pub decode_ns: AtomicU64,
     pub decode_worst_ns: AtomicU64,
     pub presented: AtomicU64,
     pub awaiting_idr: AtomicBool,
+    /// ltrpEnabled in the latest answer: 0 unknown, 1 off, 2 on.
+    answer_ltrp: AtomicU8,
     /// Session clock (ms) of each tile's latest packet and picture.
     tile_packet_ms: [AtomicU64; MAX_TILES],
     tile_picture_ms: [AtomicU64; MAX_TILES],
-    recovery: Mutex<RecoveryTracker>,
+    /// Per tile: new RTP timestamps, and sequence number holes.
+    tile_frames: [AtomicU64; MAX_TILES],
+    tile_holes: [AtomicU64; MAX_TILES],
+    recovery: Mutex<Outages>,
 }
 
 fn kind_index(k: Recovery) -> usize {
@@ -119,10 +156,48 @@ impl Metrics {
         self.holds_given_up.fetch_add(h.given_up as u64, Ordering::Relaxed);
     }
 
-    /// A keyframe request went out for `tile`.
-    pub fn keyframe_sent(&self, kind: Recovery, tile: usize, at: Instant) {
-        self.keyframes[kind_index(kind)].fetch_add(1, Ordering::Relaxed);
-        self.recovery.lock().requested(tile, at);
+    /// A keyframe request went out for one tile.
+    pub fn keyframe_sent(&self, kind: Recovery, cause: KeyframeCause) {
+        if cause.is_loss() {
+            self.kf_loss[kind_index(kind)].fetch_add(1, Ordering::Relaxed);
+        }
+        self.kf_cause[cause as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A loss was found in IRAP epoch `epoch` and a keyframe asked for.
+    pub fn outage(&self, epoch: u64, at: Instant) {
+        self.recovery.lock().start(epoch, at);
+    }
+
+    /// The stream was replaced; an open outage won't be repaired.
+    pub fn end_outage(&self) {
+        self.recovery.lock().open = None;
+    }
+
+    /// A NACKed packet arrived, `after` its first NACK.
+    pub fn nack_arrived(&self, after: Duration) {
+        self.nacked_arrived.fetch_add(1, Ordering::Relaxed);
+        let mut l = self.nack_latency.lock();
+        if l.len() < MAX_SAMPLES {
+            l.push(after);
+        }
+    }
+
+    pub fn set_answer_ltrp(&self, ltrp: Option<bool>) {
+        let v = match ltrp {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        };
+        self.answer_ltrp.store(v, Ordering::Relaxed);
+    }
+
+    fn answer_ltrp(&self) -> Option<bool> {
+        match self.answer_ltrp.load(Ordering::Relaxed) {
+            1 => Some(false),
+            2 => Some(true),
+            _ => None,
+        }
     }
 
     pub fn decoded(&self, took: Duration) {
@@ -138,14 +213,33 @@ impl Metrics {
         }
     }
 
-    /// A picture for `tile` was published; `clean` if not damaged.
-    pub fn picture(&self, tile: usize, clean: bool, now_ms: u64, at: Instant) {
+    /// A packet with a newer RTP timestamp arrived for `tile`.
+    pub fn tile_frame(&self, tile: usize) {
+        if let Some(t) = self.tile_frames.get(tile) {
+            t.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// `n` sequence numbers were skipped on `tile`.
+    pub fn tile_holes(&self, tile: usize, n: u64) {
+        if let Some(t) = self.tile_holes.get(tile)
+            && n > 0
+        {
+            t.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    /// New RTP timestamps and holes on `tile` since the last call.
+    fn take_tile(&self, tile: usize) -> (u64, u64) {
+        (self.tile_frames[tile].swap(0, Ordering::Relaxed), self.tile_holes[tile].swap(0, Ordering::Relaxed))
+    }
+
+    /// A picture for `tile` from IRAP epoch `epoch` was published.
+    pub fn picture(&self, tile: usize, epoch: u64, now_ms: u64, at: Instant) {
         if let Some(t) = self.tile_picture_ms.get(tile) {
             t.store(now_ms, Ordering::Relaxed);
         }
-        if clean {
-            self.recovery.lock().clean(tile, at);
-        }
+        self.recovery.lock().picture(epoch, at);
     }
 
     /// Whether the picture counts as frozen at `now_ms` (see the module
@@ -162,37 +256,39 @@ impl Metrics {
     }
 }
 
-/// Times from keyframe requests to the next clean picture of their tile.
+/// Outages from a loss to the first picture after the keyframe that
+/// repaired it (see the module docs).
 #[derive(Default)]
-struct RecoveryTracker {
-    /// Unanswered requests per tile.
-    pending: HashMap<usize, Vec<Instant>>,
+struct Outages {
+    /// The IRAP epoch the open outage started in, and when.
+    open: Option<(u64, Instant)>,
     samples: Vec<Duration>,
 }
 
-impl RecoveryTracker {
-    fn requested(&mut self, tile: usize, at: Instant) {
-        let p = self.pending.entry(tile).or_default();
-        if p.len() < MAX_SAMPLES {
-            p.push(at);
+impl Outages {
+    fn start(&mut self, epoch: u64, at: Instant) {
+        if self.open.is_none() {
+            self.open = Some((epoch, at));
         }
     }
 
-    fn clean(&mut self, tile: usize, at: Instant) {
-        let Some(p) = self.pending.remove(&tile) else { return };
-        for t in p {
+    fn picture(&mut self, epoch: u64, at: Instant) {
+        if let Some((started, t)) = self.open
+            && epoch > started
+        {
+            self.open = None;
             if self.samples.len() < MAX_SAMPLES {
                 self.samples.push(at.saturating_duration_since(t));
             }
         }
     }
+}
 
-    /// Count, median and max of the samples since the last call.
-    fn take(&mut self) -> (usize, Option<(Duration, Duration)>) {
-        let mut s = std::mem::take(&mut self.samples);
-        s.sort_unstable();
-        (s.len(), s.last().map(|&max| (s[s.len() / 2], max)))
-    }
+/// Count, median and max of `samples`, emptying it.
+fn summary(samples: &mut Vec<Duration>) -> (usize, Option<(Duration, Duration)>) {
+    let mut s = std::mem::take(samples);
+    s.sort_unstable();
+    (s.len(), s.last().map(|&max| (s[s.len() / 2], max)))
 }
 
 /// Formats a float for JSON: finite, at most `digits` decimals.
@@ -200,14 +296,29 @@ fn num(v: f64, digits: usize) -> String {
     if v.is_finite() { format!("{v:.digits$}") } else { "null".into() }
 }
 
+/// Packets expected over the interval, from the expected count now and at
+/// its start.
+fn expected_since(now: u64, start: Option<u64>) -> u64 {
+    // Stats restart with a new SSRC group; count from zero then.
+    now - start.filter(|&e| e <= now).unwrap_or(0)
+}
+
 /// Per-tile loss over the interval, from `(expected, received)` now and at
 /// its start.
 fn loss_pct(now: (u64, u64), start: Option<(u64, u64)>) -> f64 {
-    // Stats restart with a new SSRC group; count from zero then.
-    let (e0, r0) = start.filter(|&(e, _)| e <= now.0).unwrap_or((0, 0));
-    let exp = now.0 - e0;
+    let r0 = start.filter(|&(e, _)| e <= now.0).map_or(0, |s| s.1);
+    let exp = expected_since(now.0, start.map(|s| s.0));
     let rcv = now.1.saturating_sub(r0);
     if exp == 0 { 0.0 } else { exp.saturating_sub(rcv) as f64 * 100.0 / exp as f64 }
+}
+
+/// One tile's part of a line.
+#[derive(Clone, Copy, Default)]
+struct TileLine {
+    loss_pct: f64,
+    loss_pre_pct: f64,
+    jitter_ms: f64,
+    fps: f64,
 }
 
 /// The values of one line that don't come from [`Metrics`] counters.
@@ -216,7 +327,8 @@ struct LineContext<'a> {
     session_t: f64,
     dt: f64,
     op: &'a super::OperatingPoint,
-    tiles: &'a [(f64, f64)],
+    canvas: Option<(u32, u32)>,
+    tiles: &'a [TileLine],
     frozen_ms: u64,
     rtt: Option<Duration>,
 }
@@ -224,8 +336,9 @@ struct LineContext<'a> {
 fn line(m: &Metrics, cx: &LineContext) -> String {
     let take = |c: &AtomicU64| c.swap(0, Ordering::Relaxed);
     let rate = |n: u64| num(n as f64 / cx.dt, 1);
+    let ms = |d: Duration| num(d.as_secs_f64() * 1000.0, 1);
     let op = cx.op;
-    let mut s = String::with_capacity(512);
+    let mut s = String::with_capacity(1024);
     let _ = write!(
         s,
         "{{\"t\":{},\"session_t\":{},\"dt\":{},\"op\":{{\"render_scale\":{},\"fps\":{},\"recovery\":\"{}\",\
@@ -240,42 +353,73 @@ fn line(m: &Metrics, cx: &LineContext) -> String {
         m.holding.load(Ordering::Relaxed),
         op.ltr,
     );
-    let _ = write!(s, ",\"video_pps\":{},\"video_bytes_ps\":{}", rate(take(&m.video_packets)), rate(take(&m.video_bytes)));
+    match cx.canvas {
+        Some((w, h)) => {
+            let _ = write!(s, ",\"canvas\":[{w},{h}]");
+        }
+        None => s.push_str(",\"canvas\":null"),
+    }
+    match m.answer_ltrp() {
+        Some(v) => {
+            let _ = write!(s, ",\"answer_ltrp\":{v}");
+        }
+        None => s.push_str(",\"answer_ltrp\":null"),
+    }
+    let max_fps = cx.tiles.iter().map(|t| t.fps).fold(None, |a: Option<f64>, f| Some(a.map_or(f, |a| a.max(f))));
+    let _ = write!(
+        s,
+        ",\"max_tile_fps\":{},\"video_pps\":{},\"video_bytes_ps\":{}",
+        max_fps.map_or("null".into(), |f| num(f, 1)),
+        rate(take(&m.video_packets)),
+        rate(take(&m.video_bytes)),
+    );
     s.push_str(",\"tiles\":[");
-    for (i, (loss, jitter)) in cx.tiles.iter().enumerate() {
+    for (i, t) in cx.tiles.iter().enumerate() {
         if i > 0 {
             s.push(',');
         }
-        let _ = write!(s, "{{\"loss_pct\":{},\"jitter_ms\":{}}}", num(*loss, 2), num(*jitter, 2));
+        let _ = write!(
+            s,
+            "{{\"loss_pct\":{},\"loss_pre_pct\":{},\"jitter_ms\":{},\"fps\":{}}}",
+            num(t.loss_pct, 2),
+            num(t.loss_pre_pct, 2),
+            num(t.jitter_ms, 2),
+            num(t.fps, 1),
+        );
     }
     s.push(']');
+    let _ = write!(s, ",\"nacks\":{},\"nack_retries\":{},\"nacked_arrived\":{}", take(&m.nacked), take(&m.nack_retries), take(&m.nacked_arrived));
+    match summary(&mut m.nack_latency.lock()) {
+        (_, Some((p50, max))) => {
+            let _ = write!(s, ",\"nack_arrival_p50_ms\":{},\"nack_arrival_max_ms\":{}", ms(p50), ms(max));
+        }
+        (_, None) => s.push_str(",\"nack_arrival_p50_ms\":null,\"nack_arrival_max_ms\":null"),
+    }
     let _ = write!(
         s,
-        ",\"nacks\":{},\"nack_retries\":{},\"nacked_arrived\":{},\"holds_started\":{},\"holds_filled\":{},\
-         \"holds_given_up\":{}",
-        take(&m.nacked),
-        take(&m.nack_retries),
-        take(&m.nacked_arrived),
+        ",\"holds_started\":{},\"holds_filled\":{},\"holds_given_up\":{}",
         take(&m.holds_started),
         take(&m.holds_filled),
         take(&m.holds_given_up),
     );
-    let [fir, pli, both] = m.keyframes.each_ref().map(take);
+    let [fir, pli, both] = m.kf_loss.each_ref().map(take);
+    let _ = write!(s, ",\"kf_loss_fir\":{fir},\"kf_loss_pli\":{pli},\"kf_loss_fir_pli\":{both}");
+    for (cause, n) in KeyframeCause::ALL.iter().zip(&m.kf_cause) {
+        let _ = write!(s, ",\"kf_{}\":{}", cause.name(), take(n));
+    }
     let _ = write!(
         s,
-        ",\"kf_fir\":{fir},\"kf_pli\":{pli},\"kf_fir_pli\":{both},\"kf_suppressed\":{},\"irap_aus\":{},\
-         \"irap_bytes\":{}",
+        ",\"kf_suppressed\":{},\"irap_aus\":{},\"irap_bytes\":{},\"irap_follow_bytes\":{}",
         take(&m.keyframes_suppressed),
         take(&m.irap_aus),
         take(&m.irap_bytes),
+        take(&m.irap_follow_bytes),
     );
-    let ms = |d: Duration| num(d.as_secs_f64() * 1000.0, 1);
-    let (n, rec) = m.recovery.lock().take();
-    match rec {
-        Some((p50, max)) => {
+    match summary(&mut m.recovery.lock().samples) {
+        (n, Some((p50, max))) => {
             let _ = write!(s, ",\"recovery_n\":{n},\"recovery_p50_ms\":{},\"recovery_max_ms\":{}", ms(p50), ms(max));
         }
-        None => s.push_str(",\"recovery_n\":0,\"recovery_p50_ms\":null,\"recovery_max_ms\":null"),
+        (_, None) => s.push_str(",\"recovery_n\":0,\"recovery_p50_ms\":null,\"recovery_max_ms\":null"),
     }
     let aus = take(&m.decoded_aus);
     let busy = Duration::from_nanos(take(&m.decode_ns));
@@ -311,7 +455,13 @@ pub(super) fn writer(shared: Arc<Shared>, path: PathBuf) {
     tracing::info!("writing stats to {}", path.display());
     let m = &shared.metrics;
     // Drop what accumulated while connecting.
-    let _ = line(m, &LineContext { t: 0.0, session_t: 0.0, dt: 1.0, op: &shared.op(), tiles: &[], frozen_ms: 0, rtt: None });
+    let _ = line(
+        m,
+        &LineContext { t: 0.0, session_t: 0.0, dt: 1.0, op: &shared.op(), canvas: None, tiles: &[], frozen_ms: 0, rtt: None },
+    );
+    for i in 0..MAX_TILES {
+        m.take_tile(i);
+    }
     let mut start: HashMap<u32, (u64, u64)> = HashMap::new();
     let mut since = Instant::now();
     let mut frozen_samples = 0u64;
@@ -326,6 +476,7 @@ pub(super) fn writer(shared: Arc<Shared>, path: PathBuf) {
             continue;
         }
         since = Instant::now();
+        let secs = dt.as_secs_f64();
         let ssrcs = shared.tile_ssrcs.lock().clone();
         let now: HashMap<u32, (u64, u64, u32)> = {
             let stats = shared.rx_stats.lock();
@@ -334,11 +485,26 @@ pub(super) fn writer(shared: Arc<Shared>, path: PathBuf) {
                 .filter_map(|s| stats.get(s).map(|r| (*s, (r.expected(), r.received(), r.jitter()))))
                 .collect()
         };
-        let tiles: Vec<(f64, f64)> = ssrcs
+        let counts: Vec<(u64, u64)> = (0..MAX_TILES).map(|i| m.take_tile(i)).collect();
+        let tiles: Vec<TileLine> = ssrcs
             .iter()
-            .map(|s| match now.get(s) {
-                Some(&(e, r, j)) => (loss_pct((e, r), start.get(s).copied()), j as f64 * 1000.0 / VIDEO_CLOCK_HZ as f64),
-                None => (0.0, 0.0),
+            .enumerate()
+            .map(|(i, s)| {
+                let (frames, holes) = counts.get(i).copied().unwrap_or_default();
+                let fps = frames as f64 / secs;
+                match now.get(s) {
+                    Some(&(e, r, j)) => {
+                        let s0 = start.get(s).copied();
+                        let exp = expected_since(e, s0.map(|s| s.0));
+                        TileLine {
+                            loss_pct: loss_pct((e, r), s0),
+                            loss_pre_pct: if exp == 0 { 0.0 } else { (holes as f64 * 100.0 / exp as f64).min(100.0) },
+                            jitter_ms: j as f64 * 1000.0 / VIDEO_CLOCK_HZ as f64,
+                            fps,
+                        }
+                    }
+                    None => TileLine { fps, ..TileLine::default() },
+                }
             })
             .collect();
         start = now.into_iter().map(|(s, (e, r, _))| (s, (e, r))).collect();
@@ -346,8 +512,9 @@ pub(super) fn writer(shared: Arc<Shared>, path: PathBuf) {
         let cx = LineContext {
             t,
             session_t: shared.clock.0.elapsed().as_secs_f64(),
-            dt: dt.as_secs_f64(),
+            dt: secs,
             op: &shared.op(),
+            canvas: *shared.canvas.lock(),
             tiles: &tiles,
             frozen_ms: (frozen_samples * SAMPLE_EVERY.as_millis() as u64).min(dt.as_millis() as u64),
             rtt: *shared.rtt.lock(),
@@ -368,21 +535,57 @@ mod tests {
     use crate::session::{Fps, OperatingPoint};
 
     #[test]
-    fn recovery_latency_per_request() {
+    fn one_sample_per_outage() {
         let t0 = Instant::now();
         let ms = |n| t0 + Duration::from_millis(n);
-        let mut r = RecoveryTracker::default();
-        r.requested(1, t0);
-        r.requested(1, ms(500));
-        r.requested(2, ms(100));
-        // Another tile's picture doesn't answer tile 1.
-        r.clean(0, ms(600));
-        r.clean(1, ms(700));
-        r.clean(1, ms(800));
-        assert_eq!(r.take(), (2, Some((Duration::from_millis(700), Duration::from_millis(700)))));
-        assert_eq!(r.take(), (0, None));
-        r.clean(2, ms(150));
-        assert_eq!(r.take(), (1, Some((Duration::from_millis(50), Duration::from_millis(50)))));
+        let m = Metrics::default();
+        // A gap in epoch 3, asked again twice before the keyframe.
+        m.outage(3, t0);
+        m.outage(3, ms(500));
+        m.outage(3, ms(900));
+        // Pictures still in epoch 3 (other tiles, clean P pictures) don't
+        // end it.
+        m.picture(1, 3, 0, ms(600));
+        m.picture(0, 3, 0, ms(650));
+        assert_eq!(summary(&mut m.recovery.lock().samples), (0, None));
+        // The first picture after the IRAP does, on any tile.
+        m.picture(2, 4, 0, ms(1000));
+        m.picture(0, 4, 0, ms(1100));
+        let one = (1, Some((Duration::from_millis(1000), Duration::from_millis(1000))));
+        assert_eq!(summary(&mut m.recovery.lock().samples), one);
+        assert_eq!(summary(&mut m.recovery.lock().samples), (0, None));
+    }
+
+    #[test]
+    fn damaged_picture_waits_for_a_later_irap() {
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        let m = Metrics::default();
+        // A damaged picture of epoch 5 that came out after IRAP 6 was fed:
+        // the picture of epoch 6 closes it.
+        m.picture(1, 5, 0, t0);
+        m.outage(5, t0);
+        m.picture(1, 5, 0, ms(30));
+        m.picture(0, 6, 0, ms(40));
+        let (n, rec) = summary(&mut m.recovery.lock().samples);
+        assert_eq!((n, rec.map(|r| r.1)), (1, Some(Duration::from_millis(40))));
+        // An outage cut short by a new stream gives no sample.
+        m.outage(6, ms(50));
+        m.end_outage();
+        m.picture(0, 7, 0, ms(90));
+        assert_eq!(summary(&mut m.recovery.lock().samples), (0, None));
+    }
+
+    #[test]
+    fn keyframe_counters_by_cause() {
+        let m = Metrics::default();
+        m.keyframe_sent(Recovery::Pli, KeyframeCause::Gap);
+        m.keyframe_sent(Recovery::Pli, KeyframeCause::Damaged);
+        m.keyframe_sent(Recovery::Pli, KeyframeCause::Stall);
+        m.keyframe_sent(Recovery::Fir, KeyframeCause::Adoption);
+        let l = line(&m, &context(&op(), &[]));
+        assert!(l.contains("\"kf_loss_fir\":0,\"kf_loss_pli\":2,\"kf_loss_fir_pli\":0,\"kf_gap\":1,\"kf_decode\":0,\
+                            \"kf_damaged\":1,\"kf_adoption\":1,\"kf_reoffer\":0,\"kf_stall\":1,"));
     }
 
     #[test]
@@ -393,7 +596,7 @@ mod tests {
         m.tile_packet(1, 4950);
         m.tile_picture_ms[1].store(4800, Ordering::Relaxed);
         assert!(m.frozen(5000, 4950));
-        m.picture(1, true, 4990, Instant::now());
+        m.picture(1, 0, 4990, Instant::now());
         assert!(!m.frozen(5000, 4950));
         // Waiting for a keyframe while video flows.
         m.awaiting_idr.store(true, Ordering::Relaxed);
@@ -408,21 +611,32 @@ mod tests {
         assert_eq!(loss_pct((100, 100), Some((100, 100))), 0.0);
         // A new SSRC group restarted the counts.
         assert_eq!(loss_pct((10, 9), Some((100, 100))), 10.0);
+        assert_eq!(expected_since(10, Some(100)), 10);
+        assert_eq!(expected_since(150, Some(100)), 50);
+    }
+
+    fn context<'a>(op: &'a OperatingPoint, tiles: &'a [TileLine]) -> LineContext<'a> {
+        LineContext { t: 0.0, session_t: 0.0, dt: 1.0, op, canvas: None, tiles, frozen_ms: 0, rtt: None }
+    }
+
+    fn op() -> OperatingPoint {
+        OperatingPoint { render_scale: 0.5, fps: Fps::Thirty, recovery: Recovery::Pli, hold: HoldMode::Off, ltr: false }
     }
 
     #[test]
     fn line_is_json_with_every_field() {
         let m = Metrics::default();
         m.video_packets.store(100, Ordering::Relaxed);
-        m.keyframe_sent(Recovery::Pli, 0, Instant::now());
+        m.keyframe_sent(Recovery::Pli, KeyframeCause::Gap);
+        m.nack_arrived(Duration::from_millis(12));
+        m.nack_arrived(Duration::from_millis(30));
+        m.set_answer_ltrp(Some(false));
         m.decoded(Duration::from_millis(3));
-        let op = OperatingPoint {
-            render_scale: 0.5,
-            fps: Fps::Thirty,
-            recovery: Recovery::Pli,
-            hold: HoldMode::Off,
-            ltr: false,
-        };
+        let op = op();
+        let tiles = [
+            TileLine { loss_pct: 1.0, loss_pre_pct: 3.0, jitter_ms: 2.5, fps: 29.5 },
+            TileLine { fps: 30.0, ..TileLine::default() },
+        ];
         let l = line(
             &m,
             &LineContext {
@@ -430,7 +644,8 @@ mod tests {
                 session_t: 2.0,
                 dt: 2.0,
                 op: &op,
-                tiles: &[(1.0, 2.5), (0.0, 0.0)],
+                canvas: Some((2560, 1440)),
+                tiles: &tiles,
                 frozen_ms: 30,
                 rtt: None,
             },
@@ -438,16 +653,36 @@ mod tests {
         assert_eq!(
             l,
             "{\"t\":1.500,\"session_t\":2.000,\"dt\":2.000,\"op\":{\"render_scale\":0.5,\"fps\":30,\
-             \"recovery\":\"pli\",\"hold\":\"off\",\"holding\":false,\"ltr\":false},\"video_pps\":50.0,\
-             \"video_bytes_ps\":0.0,\"tiles\":[{\"loss_pct\":1.00,\"jitter_ms\":2.50},{\"loss_pct\":0.00,\
-             \"jitter_ms\":0.00}],\"nacks\":0,\"nack_retries\":0,\"nacked_arrived\":0,\"holds_started\":0,\
-             \"holds_filled\":0,\"holds_given_up\":0,\"kf_fir\":0,\"kf_pli\":1,\"kf_fir_pli\":0,\
-             \"kf_suppressed\":0,\"irap_aus\":0,\"irap_bytes\":0,\"recovery_n\":0,\"recovery_p50_ms\":null,\
-             \"recovery_max_ms\":null,\"frozen_ms\":30,\"decode_aus\":1,\"decode_avg_ms\":3.0,\
-             \"decode_worst_ms\":3.0,\"presented_fps\":0.0,\"rtt_ms\":null}"
+             \"recovery\":\"pli\",\"hold\":\"off\",\"holding\":false,\"ltr\":false},\"canvas\":[2560,1440],\
+             \"answer_ltrp\":false,\"max_tile_fps\":30.0,\"video_pps\":50.0,\"video_bytes_ps\":0.0,\
+             \"tiles\":[{\"loss_pct\":1.00,\"loss_pre_pct\":3.00,\"jitter_ms\":2.50,\"fps\":29.5},\
+             {\"loss_pct\":0.00,\"loss_pre_pct\":0.00,\"jitter_ms\":0.00,\"fps\":30.0}],\"nacks\":0,\
+             \"nack_retries\":0,\"nacked_arrived\":2,\"nack_arrival_p50_ms\":30.0,\"nack_arrival_max_ms\":30.0,\
+             \"holds_started\":0,\"holds_filled\":0,\"holds_given_up\":0,\"kf_loss_fir\":0,\"kf_loss_pli\":1,\
+             \"kf_loss_fir_pli\":0,\"kf_gap\":1,\"kf_decode\":0,\"kf_damaged\":0,\"kf_adoption\":0,\
+             \"kf_reoffer\":0,\"kf_stall\":0,\"kf_hw_fallback\":0,\"kf_other\":0,\"kf_suppressed\":0,\
+             \"irap_aus\":0,\"irap_bytes\":0,\"irap_follow_bytes\":0,\"recovery_n\":0,\
+             \"recovery_p50_ms\":null,\"recovery_max_ms\":null,\"frozen_ms\":30,\"decode_aus\":1,\
+             \"decode_avg_ms\":3.0,\"decode_worst_ms\":3.0,\"presented_fps\":0.0,\"rtt_ms\":null}"
         );
         // Counters were consumed.
-        assert!(line(&m, &LineContext { t: 0.0, session_t: 0.0, dt: 1.0, op: &op, tiles: &[], frozen_ms: 0, rtt: None })
-            .contains("\"video_pps\":0.0"));
+        let again = line(&m, &context(&op, &[]));
+        assert!(again.contains("\"video_pps\":0.0"));
+        assert!(again.contains("\"canvas\":null,\"answer_ltrp\":false,\"max_tile_fps\":null"));
+        assert!(again.contains("\"nack_arrival_p50_ms\":null"));
+    }
+
+    #[test]
+    fn tile_counters() {
+        let m = Metrics::default();
+        m.tile_frame(2);
+        m.tile_frame(2);
+        m.tile_holes(2, 3);
+        m.tile_holes(2, 0);
+        // Out of range is ignored.
+        m.tile_frame(MAX_TILES);
+        m.tile_holes(MAX_TILES, 1);
+        assert_eq!(m.take_tile(2), (2, 3));
+        assert_eq!(m.take_tile(2), (0, 0));
     }
 }

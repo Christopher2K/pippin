@@ -125,7 +125,8 @@ struct Cli {
     /// Skip the preliminary connection that wakes the host's daemon.
     #[arg(long)]
     no_warmup: bool,
-    /// Exit when the connection drops instead of reconnecting.
+    /// Exit when the connection drops instead of reconnecting. This also
+    /// makes `restart` on the MACSHARE_CONTROL_FIFO exit.
     #[arg(long)]
     no_reconnect: bool,
     /// More logging; repeat for debug output.

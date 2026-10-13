@@ -40,7 +40,7 @@ use crate::proto::record::RecordSealer;
 use crate::rtp::stats::ReceiverStats;
 use crate::video::decoder::{DecoderKind, Picture};
 
-pub use media::Feedback;
+pub use media::{Feedback, KeyframeCause};
 pub use operating::{Fps, OperatingPoint, SharedOp, parse_on_off};
 
 use crate::errors::Failure;
@@ -548,6 +548,7 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
             shared.tiles.store(c.tiles, Ordering::Relaxed);
         }
         shared.set_canvas(c.width, c.height);
+        shared.metrics.set_answer_ltrp(c.ltrp);
     }
     // We write to the host every tick (cursor poll), so a host that went to
     // sleep or a vanished network shows up as unacknowledged data; give up
