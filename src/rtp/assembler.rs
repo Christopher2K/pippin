@@ -7,7 +7,7 @@
 //!
 //! An access unit whose marker arrived with packets missing is held for a
 //! short wait so NACK retransmissions and reordered packets can fill it,
-//! instead of being given up at once (which costs the tile a keyframe).
+//! instead of being given up at once (which costs a keyframe).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -15,22 +15,23 @@ use std::time::{Duration, Instant};
 use super::hevc;
 use super::srtp::RtpPacket;
 
-/// A group whose marker hasn't arrived, with no later traffic on its SSRC,
-/// is given up after this long without a packet.
+/// How often the receiver should call [`Assembler::evict`] (and retry
+/// NACKs) while anything is pending.
+pub const POLL_EVERY: Duration = Duration::from_millis(5);
+/// A group whose marker hasn't arrived, with nothing after it in decode
+/// order, is given up after this long without a packet.
 const GROUP_TTL: Duration = Duration::from_millis(200);
 const FLUSHED_TTL: Duration = Duration::from_secs(2);
-/// Hold for missing packets when no round-trip estimate is available.
-const DEFAULT_WAIT: Duration = Duration::from_millis(60);
+/// Round trip assumed until the host reports one.
+const DEFAULT_RTT: Duration = Duration::from_millis(25);
+/// Host turnaround for a retransmission, plus jitter and reordering.
+const TURNAROUND: Duration = Duration::from_millis(10);
 /// Bounds on the hold, whatever the round-trip estimate says.
 const MIN_WAIT: Duration = Duration::from_millis(20);
 const MAX_WAIT: Duration = Duration::from_millis(300);
-/// Added to two round trips (NACK plus one retry) for reordering and host
-/// turnaround.
-const REORDER_SLACK: Duration = Duration::from_millis(20);
-/// Packets this close behind an SSRC's last emitted marker belong to access
-/// units already emitted or given up, and are dropped. Further back counts as
-/// a sequence jump.
-const STALE_SEQS: u16 = 0x1000;
+/// This many packets in a row behind an SSRC's last marker means its
+/// sequence numbers restarted rather than stragglers arriving.
+const STALE_RESET: u32 = 256;
 const ADOPT_MIN_PACKETS: u32 = 5;
 const INITIAL_SETTLE: Duration = Duration::from_millis(300);
 const BACKLOG_AGE: Duration = Duration::from_secs(3);
@@ -43,7 +44,17 @@ pub struct AccessUnit {
     pub donl: Option<u16>,
     /// False if packets were lost; only parameter sets are kept then.
     pub complete: bool,
+    /// Complete only because a hold let retransmissions or late packets in.
+    pub recovered: bool,
     pub received: Instant,
+}
+
+/// Hold outcomes since the last [`Assembler::take_stats`].
+#[derive(Default, Clone, Copy)]
+pub struct HoldStats {
+    pub started: u32,
+    pub filled: u32,
+    pub given_up: u32,
 }
 
 struct Group {
@@ -55,16 +66,25 @@ struct Group {
     last: u16,
     /// Sequence number and arrival of the marker packet.
     marker: Option<(u16, Instant)>,
+    /// DONL of the earliest packet: the host's decode order across SSRCs.
+    donl: Option<u16>,
+    /// Was waited on for missing packets.
+    held: bool,
 }
 
 impl Group {
+    fn new(now: Instant) -> Self {
+        Self { packets: Vec::new(), started: now, last_at: now, first: 0, last: 0, marker: None, donl: None, held: false }
+    }
+
     fn insert(&mut self, seq: u16, marker: bool, payload: Vec<u8>, now: Instant) {
-        if self.packets.is_empty() {
-            (self.first, self.last) = (seq, seq);
-        } else if seq.wrapping_sub(self.first) >= 0x8000 {
-            self.first = seq;
-        } else if seq.wrapping_sub(self.last) < 0x8000 {
+        let earliest = self.packets.is_empty() || seq.wrapping_sub(self.first) >= 0x8000;
+        if self.packets.is_empty() || (!earliest && seq.wrapping_sub(self.last) < 0x8000) {
             self.last = seq;
+        }
+        if earliest {
+            self.first = seq;
+            self.donl = hevc::first_donl(&[(seq, payload.as_slice())]);
         }
         if marker {
             self.marker = Some((seq, now));
@@ -72,76 +92,125 @@ impl Group {
         self.last_at = now;
         self.packets.push((seq, marker, payload));
     }
-}
 
-/// What to do with the oldest pending group of an SSRC.
-enum Verdict {
-    Wait,
-    Emit { complete: bool },
-}
-
-/// Sorts a group's packets into sequence order, handling 16-bit wrap.
-fn ordered(packets: &mut [(u16, bool, Vec<u8>)]) {
-    packets.sort_by_key(|p| p.0);
-    if packets.len() >= 2 && packets[packets.len() - 1].0.wrapping_sub(packets[0].0) > 0x8000 {
-        // The group straddles the wrap: rotate so it starts after the largest gap.
-        let (idx, _) = packets
-            .iter()
-            .enumerate()
-            .map(|(i, p)| (i, packets[(i + 1) % packets.len()].0.wrapping_sub(p.0)))
-            .max_by_key(|&(_, gap)| gap)
-            .unwrap();
-        packets.rotate_left(idx + 1);
+    /// Payloads in sequence order.
+    fn payloads(&self) -> Vec<(u16, &[u8])> {
+        let mut refs: Vec<(u16, &[u8])> = self.packets.iter().map(|p| (p.0, p.2.as_slice())).collect();
+        refs.sort_by_key(|r| r.0.wrapping_sub(self.first));
+        refs
     }
 }
 
-/// Access units leave in sequence order per SSRC. When the oldest one is
-/// held for missing packets, later ones (even complete) wait behind it: they
-/// predict from it, so decoding them first, or giving up on it to release
-/// them sooner, would only produce corrupt pictures and a keyframe request
-/// anyway. Their extra latency is bounded by the hold.
+/// Whether group `a` (of SSRC `sa`) comes before `b` in decode order.
+///
+/// Within an SSRC that is sequence order. Across SSRCs it is DONL order:
+/// Apple numbers access units across all tiles of the coded sequence, and
+/// unlike arrival order that survives network reordering and a lost first
+/// packet (every packet, FU fragments included, carries the DONL). Equal
+/// DONLs fall back to tile order, missing ones to arrival.
+fn before(sa: u32, a: &Group, sb: u32, b: &Group) -> bool {
+    if sa == sb {
+        return a.first.wrapping_sub(b.first) >= 0x8000;
+    }
+    match (a.donl, b.donl) {
+        (Some(x), Some(y)) if x != y => x.wrapping_sub(y) >= 0x8000,
+        (Some(_), Some(_)) => sa < sb,
+        _ => a.started < b.started,
+    }
+}
+
+/// What to do with the first pending group in decode order.
+enum Verdict {
+    /// Not ready; `holding` if that is for missing packets rather than the
+    /// rest of the access unit still arriving.
+    Wait { holding: bool },
+    Emit { complete: bool },
+}
+
+/// Access units leave in decode order: per SSRC, and across the adopted
+/// tiles, which share one decoder and reference each other's pictures. When
+/// the first one is held for missing packets, later ones (even complete)
+/// wait behind it: decoding them first would decode against a missing
+/// reference, and giving up on it to release them sooner would cost a
+/// keyframe anyway. Their extra latency is bounded by the hold. SSRCs not
+/// adopted are ordered on their own and never block the tiles.
 pub struct Assembler {
     groups: HashMap<(u32, u32), Group>,
     flushed: HashMap<(u32, u32), Instant>,
     last_marker: HashMap<u32, u16>,
-    wait: Duration,
+    /// Packets dropped in a row per SSRC for being behind its last marker.
+    stale: HashMap<u32, u32>,
+    /// The adopted tile SSRCs, ordered together.
+    linked: HashSet<u32>,
+    rtt: Duration,
+    stats: HoldStats,
 }
 
 impl Default for Assembler {
     fn default() -> Self {
-        Self { groups: HashMap::new(), flushed: HashMap::new(), last_marker: HashMap::new(), wait: DEFAULT_WAIT }
+        Self {
+            groups: HashMap::new(),
+            flushed: HashMap::new(),
+            last_marker: HashMap::new(),
+            stale: HashMap::new(),
+            linked: HashSet::new(),
+            rtt: DEFAULT_RTT,
+            stats: HoldStats::default(),
+        }
     }
 }
 
 impl Assembler {
-    /// How long an access unit with missing packets is held after its marker.
-    pub fn wait(&self) -> Duration {
-        self.wait
+    /// Orders these SSRCs' access units together (the adopted tiles).
+    pub fn link(&mut self, ssrcs: &[u32]) {
+        self.linked = ssrcs.iter().copied().collect();
     }
 
-    /// Sizes the hold from a round-trip estimate: room for a NACK and one
-    /// retry.
     pub fn set_rtt(&mut self, rtt: Duration) {
-        self.wait = (rtt * 2 + REORDER_SLACK).clamp(MIN_WAIT, MAX_WAIT);
+        self.rtt = rtt;
     }
 
-    /// Adds a packet; returns the access units it completes, in order.
+    /// When a NACK still unanswered should be sent again: about a round
+    /// trip after the first.
+    pub fn retry_after(&self) -> Duration {
+        self.rtt + TURNAROUND
+    }
+
+    /// How long an access unit with missing packets is held after its
+    /// marker: room for the NACK, one retry and its answer, plus a poll.
+    pub fn wait(&self) -> Duration {
+        (self.retry_after() * 2 + POLL_EVERY).clamp(MIN_WAIT, MAX_WAIT)
+    }
+
+    /// Something is in progress, so [`evict`](Self::evict) has work to do.
+    pub fn pending(&self) -> bool {
+        !self.groups.is_empty()
+    }
+
+    pub fn take_stats(&mut self) -> HoldStats {
+        std::mem::take(&mut self.stats)
+    }
+
+    /// Adds a packet; returns the access units it releases, in decode order.
     pub fn push(&mut self, pkt: RtpPacket, now: Instant) -> Vec<AccessUnit> {
         let key = (pkt.ssrc, pkt.ts);
         if self.flushed.contains_key(&key) {
             return Vec::new();
         }
-        if self.last_marker.get(&pkt.ssrc).is_some_and(|&m| m.wrapping_sub(pkt.seq) < STALE_SEQS) {
-            return Vec::new();
+        if let Some(&m) = self.last_marker.get(&pkt.ssrc)
+            && pkt.seq.wrapping_sub(m.wrapping_add(1)) >= 0x8000
+        {
+            // Behind the last emitted access unit: a straggler for one
+            // already emitted or given up.
+            let n = self.stale.entry(pkt.ssrc).or_default();
+            *n += 1;
+            if *n < STALE_RESET {
+                return Vec::new();
+            }
+            self.last_marker.remove(&pkt.ssrc);
         }
-        let g = self.groups.entry(key).or_insert_with(|| Group {
-            packets: Vec::new(),
-            started: now,
-            last_at: now,
-            first: 0,
-            last: 0,
-            marker: None,
-        });
+        self.stale.remove(&pkt.ssrc);
+        let g = self.groups.entry(key).or_insert_with(|| Group::new(now));
         if g.packets.iter().any(|p| p.0 == pkt.seq) {
             return Vec::new();
         }
@@ -157,9 +226,12 @@ impl Assembler {
 
     /// Gives up on groups that waited too long: their access units come out
     /// incomplete (so the decoder asks for a keyframe), followed by any
-    /// complete ones that were queued behind them.
+    /// that were queued behind them.
     pub fn evict(&mut self, now: Instant) -> Vec<AccessUnit> {
-        let ssrcs: HashSet<u32> = self.groups.keys().map(|k| k.0).collect();
+        let mut ssrcs: HashSet<u32> = self.groups.keys().map(|k| k.0).collect();
+        if let Some(&any) = ssrcs.iter().find(|s| self.linked.contains(s)) {
+            ssrcs.retain(|s| *s == any || !self.linked.contains(s));
+        }
         let mut out = Vec::new();
         for ssrc in ssrcs {
             self.release(ssrc, now, &mut out);
@@ -168,12 +240,16 @@ impl Assembler {
         out
     }
 
-    /// The pending group of `ssrc` that comes first in sequence order.
+    fn same_order(&self, a: u32, b: u32) -> bool {
+        a == b || (self.linked.contains(&a) && self.linked.contains(&b))
+    }
+
+    /// The pending group ordered with `ssrc` that comes first.
     fn head(&self, ssrc: u32) -> Option<(u32, u32)> {
         self.groups
             .iter()
-            .filter(|(k, _)| k.0 == ssrc)
-            .reduce(|a, b| if b.1.first.wrapping_sub(a.1.first) >= 0x8000 { b } else { a })
+            .filter(|(k, _)| self.same_order(k.0, ssrc))
+            .reduce(|a, b| if before(b.0.0, b.1, a.0.0, a.1) { b } else { a })
             .map(|(k, _)| *k)
     }
 
@@ -182,55 +258,94 @@ impl Assembler {
         let Some((mseq, marker_at)) = g.marker else {
             // The marker is missing. Once later traffic shows the group's
             // tail was lost, allow the same wait for a retransmission.
-            let later = self.groups.iter().filter(|(k, _)| k.0 == key.0 && **k != key).map(|(_, o)| o.started).min();
+            let later = self
+                .groups
+                .iter()
+                .filter(|(k, _)| **k != key && self.same_order(k.0, key.0))
+                .map(|(_, o)| o.started)
+                .min();
             let deadline = match later {
-                Some(t) => t + self.wait,
+                Some(t) => t.max(g.last_at) + self.wait(),
                 None => g.last_at + GROUP_TTL,
             };
-            return if now >= deadline { Verdict::Emit { complete: false } } else { Verdict::Wait };
+            return if now >= deadline {
+                Verdict::Emit { complete: false }
+            } else {
+                Verdict::Wait { holding: later.is_some() }
+            };
         };
         if g.last != mseq {
             // A packet after the marker in the same group: no retransmission
             // will make this whole.
             return Verdict::Emit { complete: false };
         }
-        let starts_after_prev = self.last_marker.get(&key.0).is_none_or(|&m| g.first == m.wrapping_add(1));
         let contiguous = g.packets.len() == mseq.wrapping_sub(g.first) as usize + 1;
-        if starts_after_prev && contiguous {
+        let starts_after_prev = self.last_marker.get(&key.0).is_none_or(|&m| g.first == m.wrapping_add(1));
+        // An IRAP resets the shared DPB, so whatever came before it no
+        // longer matters.
+        if contiguous && (starts_after_prev || hevc::depayload(&g.payloads()).iter().any(|n| hevc::is_irap(n))) {
             Verdict::Emit { complete: true }
-        } else if now >= marker_at + self.wait {
+        } else if now >= marker_at + self.wait() {
             Verdict::Emit { complete: false }
         } else {
-            Verdict::Wait
+            Verdict::Wait { holding: true }
         }
     }
 
-    /// Emits the SSRC's groups in order for as long as the oldest is ready.
+    /// Emits groups in decode order for as long as the first is ready.
     fn release(&mut self, ssrc: u32, now: Instant, out: &mut Vec<AccessUnit>) {
         while let Some(key) = self.head(ssrc) {
             match self.verdict(key, now) {
-                Verdict::Wait => break,
+                Verdict::Wait { holding } => {
+                    if let Some(g) = self.groups.get_mut(&key)
+                        && holding
+                        && !g.held
+                    {
+                        g.held = true;
+                        self.stats.started += 1;
+                    }
+                    break;
+                }
                 Verdict::Emit { complete } => out.push(self.emit(key, complete, now)),
             }
         }
     }
 
     fn emit(&mut self, key: (u32, u32), complete: bool, now: Instant) -> AccessUnit {
-        let mut g = self.groups.remove(&key).expect("emitted group exists");
+        let g = self.groups.remove(&key).expect("emitted group exists");
         self.flushed.insert(key, now);
+        if g.held {
+            if complete {
+                self.stats.filled += 1;
+            } else {
+                self.stats.given_up += 1;
+            }
+        }
         // Without a marker the end is unknown; the next group must start
-        // after everything seen so far to count as contiguous.
-        self.last_marker.insert(key.0, g.marker.map_or(g.last, |m| m.0));
-        ordered(&mut g.packets);
-        let refs: Vec<(u16, &[u8])> = g.packets.iter().map(|p| (p.0, p.2.as_slice())).collect();
+        // after everything seen so far to count as contiguous. Never move
+        // backwards.
+        let end = g.marker.map_or(g.last, |m| m.0);
+        match self.last_marker.get(&key.0) {
+            Some(&m) if end.wrapping_sub(m) >= 0x8000 => {}
+            _ => {
+                self.last_marker.insert(key.0, end);
+            }
+        }
+        let refs = g.payloads();
         let mut nalus = hevc::depayload(&refs);
         if !complete {
             nalus.retain(|n| hevc::is_param_set(n));
         }
-        AccessUnit { ssrc: key.0, nalus, donl: hevc::first_donl(&refs), complete, received: g.started }
+        AccessUnit {
+            ssrc: key.0,
+            nalus,
+            donl: hevc::first_donl(&refs),
+            complete,
+            recovered: complete && g.held,
+            received: g.started,
+        }
     }
 }
-
 
 /// Learns which SSRCs carry the active tiles.
 #[derive(Default)]
@@ -246,6 +361,11 @@ pub struct TileMap {
 
 
 impl TileMap {
+    #[cfg(test)]
+    pub fn with_tiles(tiles: Vec<u32>) -> Self {
+        Self { tiles, ..Default::default() }
+    }
+
     pub fn tile_of(&self, ssrc: u32) -> Option<usize> {
         self.tiles.iter().position(|&s| s == ssrc)
     }
@@ -338,13 +458,28 @@ mod tests {
         vec![t << 1, 1, 0, 1, 0xee]
     }
 
+    /// A trailing-slice single NAL with this DONL.
+    fn slice(donl: u16) -> Vec<u8> {
+        let d = donl.to_be_bytes();
+        vec![1 << 1, 1, d[0], d[1], 0xee]
+    }
+
     fn vps() -> Vec<u8> {
         vec![hevc::NAL_VPS << 1, 1, 0, 1, 0xaa]
+    }
+
+    /// A fragment of an IDR slice.
+    fn idr_fu(flags: u8) -> Vec<u8> {
+        vec![49 << 1, 1, flags | 19, 0, 1, 0xcc]
     }
 
     fn one(mut aus: Vec<AccessUnit>) -> AccessUnit {
         assert_eq!(aus.len(), 1);
         aus.pop().unwrap()
+    }
+
+    fn order(aus: &[AccessUnit]) -> Vec<(u32, bool)> {
+        aus.iter().map(|au| (au.ssrc, au.complete)).collect()
     }
 
     #[test]
@@ -385,10 +520,13 @@ mod tests {
         let aus = a.push(pkt(3, 11, 1, false, single(1)), t);
         assert_eq!(aus.len(), 2);
         assert!(aus.iter().all(|au| au.complete));
+        assert!(aus[0].recovered && !aus[1].recovered);
         assert_eq!(aus[0].nalus.len(), 3);
         assert_eq!(aus[1].nalus.len(), 2);
         // A duplicate retransmission is ignored.
         assert!(a.push(pkt(3, 11, 1, false, single(1)), t).is_empty());
+        let s = a.take_stats();
+        assert_eq!((s.started, s.filled, s.given_up), (1, 1, 0));
     }
 
     #[test]
@@ -432,6 +570,8 @@ mod tests {
         // The retransmission arriving too late is dropped.
         assert!(a.push(pkt(5, 101, 1, false, single(1)), t0 + a.wait()).is_empty());
         assert!(a.evict(t0 + a.wait() * 4).is_empty());
+        let s = a.take_stats();
+        assert_eq!((s.started, s.filled, s.given_up), (1, 0, 1));
 
         // A group whose marker never arrives is given up a wait after later
         // traffic shows it ended.
@@ -461,27 +601,107 @@ mod tests {
     }
 
     #[test]
+    fn far_straggler_does_not_stall() {
+        let t0 = Instant::now();
+        let mut a = Assembler::default();
+        assert!(one(a.push(pkt(2, 10000, 0, true, single(19)), t0)).complete);
+        // Far behind the last marker: dropped, not made the head.
+        assert!(a.push(pkt(2, 5000, 77, false, single(1)), t0).is_empty());
+        assert!(!a.pending());
+        assert!(one(a.push(pkt(2, 10001, 1, true, single(1)), t0)).complete);
+        // A sequence restart is accepted once it is clearly not stragglers.
+        let n = STALE_RESET as u16 - 1;
+        for i in 0..n {
+            assert!(a.push(pkt(2, 100 + i, 200 + i as u32, true, single(1)), t0).is_empty());
+        }
+        assert!(one(a.push(pkt(2, 100 + n, 200 + n as u32, true, single(1)), t0)).complete);
+    }
+
+    #[test]
+    fn irap_after_lost_tail_is_complete() {
+        for irap in [true, false] {
+            let t0 = Instant::now();
+            let mut a = Assembler::default();
+            assert!(one(a.push(pkt(9, 9, 0, true, single(1)), t0)).complete);
+            // Seq 12, this AU's tail and marker, is lost.
+            assert!(a.push(pkt(9, 10, 1, false, single(1)), t0).is_empty());
+            assert!(a.push(pkt(9, 11, 1, false, single(1)), t0).is_empty());
+            let (p1, p2) = if irap { (idr_fu(0x80), idr_fu(0x40)) } else { (single(1), single(1)) };
+            assert!(a.push(pkt(9, 13, 2, false, p1), t0).is_empty());
+            assert!(a.push(pkt(9, 14, 2, true, p2), t0).is_empty());
+            let aus = a.evict(t0 + a.wait());
+            // The keyframe doesn't start right after a known marker, but it
+            // resets the DPB, so it is complete regardless.
+            assert_eq!(order(&aus), vec![(9, false), (9, irap)]);
+        }
+    }
+
+    #[test]
+    fn hold_orders_across_linked_tiles() {
+        let t0 = Instant::now();
+        for fill in [true, false] {
+            let mut a = Assembler::default();
+            a.link(&[10, 11, 12]);
+            // Frame N: tile 10 complete, tile 11 missing seq 2, tile 12 complete.
+            assert!(one(a.push(pkt(10, 1, 1, true, slice(100)), t0)).complete);
+            assert!(a.push(pkt(11, 1, 1, false, slice(101)), t0).is_empty());
+            assert!(a.push(pkt(11, 3, 1, true, slice(101)), t0).is_empty());
+            assert!(a.push(pkt(12, 1, 1, true, slice(102)), t0).is_empty());
+            // Frame N+1's base tile waits too.
+            assert!(a.push(pkt(10, 2, 2, true, slice(103)), t0).is_empty());
+            // A stream not adopted is not held up.
+            assert!(one(a.push(pkt(99, 1, 1, true, slice(5)), t0)).complete);
+            let aus = if fill {
+                a.push(pkt(11, 2, 1, false, slice(101)), t0 + Duration::from_millis(10))
+            } else {
+                assert!(a.evict(t0 + a.wait() / 2).is_empty());
+                a.evict(t0 + a.wait())
+            };
+            assert_eq!(order(&aus), vec![(11, fill), (12, true), (10, true)]);
+        }
+
+        // A tile that goes quiet mid-frame (marker lost, nothing after it on
+        // its SSRC) is given up once the next tile shows it ended.
+        let mut a = Assembler::default();
+        a.link(&[10, 11, 12]);
+        assert!(a.push(pkt(11, 1, 1, false, slice(101)), t0).is_empty());
+        let t1 = t0 + Duration::from_millis(2);
+        assert!(a.push(pkt(12, 1, 1, true, slice(102)), t1).is_empty());
+        assert!(a.evict(t1 + a.wait() / 2).is_empty());
+        assert_eq!(order(&a.evict(t1 + a.wait())), vec![(11, false), (12, true)]);
+    }
+
+    #[test]
     fn wait_follows_rtt() {
         let mut a = Assembler::default();
-        assert_eq!(a.wait(), DEFAULT_WAIT);
-        a.set_rtt(Duration::from_millis(40));
-        assert_eq!(a.wait(), Duration::from_millis(100));
-        a.set_rtt(Duration::ZERO);
-        assert_eq!(a.wait(), MIN_WAIT.max(REORDER_SLACK));
+        assert_eq!(a.retry_after(), Duration::from_millis(35));
+        assert_eq!(a.wait(), Duration::from_millis(75));
+        // LAN: the retry's answer still lands before the give-up.
+        let rtt = Duration::from_millis(1);
+        a.set_rtt(rtt);
+        assert_eq!(a.retry_after(), Duration::from_millis(11));
+        assert_eq!(a.wait(), Duration::from_millis(27));
+        assert!(a.retry_after() + rtt + TURNAROUND + POLL_EVERY <= a.wait());
         a.set_rtt(Duration::from_secs(1));
         assert_eq!(a.wait(), MAX_WAIT);
     }
 
     #[test]
     fn adopts_busiest_consecutive_group() {
-        let mut m = TileMap::default();
-        m.first_packet = Some(Instant::now() - Duration::from_secs(1));
+        let mut m = TileMap { first_packet: Some(Instant::now() - Duration::from_secs(1)), ..Default::default() };
         for s in [10u32, 11, 12, 13, 50, 51, 52, 53] {
             for _ in 0..if s >= 50 { 20 } else { 6 } {
                 m.count_packet(s);
             }
         }
-        m.stash(AccessUnit { ssrc: 51, nalus: vec![], donl: None, complete: true, received: Instant::now() });
+        m.stash(AccessUnit {
+            ssrc: 51,
+            nalus: vec![],
+            donl: None,
+            complete: true,
+            recovered: false,
+            received: Instant::now(),
+        });
         let replay = m.try_adopt(4, false).unwrap();
         assert_eq!(m.ssrcs(), &[50, 51, 52, 53]);
         assert_eq!(replay.len(), 1);
