@@ -28,6 +28,8 @@ client window.
   `software`); `--vaapi-device` or `MACSHARE_VAAPI_DEVICE` picks the render
   node, e.g. `/dev/dri/renderD129`. Decoded planes go to the GPU as-is
   (NV12/NV24 and packed VUYX included) and are converted in the shader.
+  `--codec h264` asks for H.264 4:2:0 in one tile instead, which more GPUs
+  decode in hardware, at some cost in colour fidelity.
 - **Loss recovery.** NACKs (retried once), with frames that have holes held
   briefly for the retransmission; keyframe requests, long-term-reference
   acks, and stall detection.
@@ -143,6 +145,7 @@ ffmpeg -f lavfi -i testsrc2=size=1280x720 -frames:v 30 -c:v libx265 -pix_fmt yuv
 ffmpeg -f lavfi -i testsrc2=size=1280x720 -frames:v 30 -c:v libx265 -pix_fmt yuv420p -f hevc /tmp/t420.hevc
 ffmpeg -f lavfi -i testsrc2=size=1280x720 -frames:v 30 -c:v libx265 -pix_fmt yuv444p10le -f hevc /tmp/t444p10.hevc
 ffmpeg -f lavfi -i testsrc2=size=8448x256 -frames:v 30 -c:v libx265 -pix_fmt yuv420p -f hevc /tmp/twide.hevc
+ffmpeg -f lavfi -i testsrc2=size=1280x720 -frames:v 30 -c:v libx264 -pix_fmt yuv420p -f h264 /tmp/t264.h264
 MACSHARE_TEST_HEVC_DIR=/tmp cargo test --release -- --ignored --skip bench
 ```
 
