@@ -33,7 +33,7 @@ use crate::proto::messages::{self, DisplayRequest};
 use crate::proto::offers::MediaOffer;
 use crate::proto::record::RecordSealer;
 use crate::rtp::stats::ReceiverStats;
-use crate::video::decoder::Picture;
+use crate::video::decoder::{DecoderKind, Picture};
 
 pub use media::Feedback;
 
@@ -58,7 +58,9 @@ pub struct Config {
     pub user: String,
     pub password: String,
     pub session_mode: SessionMode,
-    pub hardware_decode: bool,
+    pub decoder: DecoderKind,
+    /// DRM render node for VAAPI; None lets FFmpeg pick.
+    pub vaapi_device: Option<String>,
     /// Software decoder threads; see `DecoderOptions`.
     pub decode_threads: u32,
     /// Present a host frame's tiles together (see `--sync-tiles`).
@@ -530,8 +532,9 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
     {
         let (shared, fb) = (shared.clone(), fb_tx.clone());
         let opts = crate::video::decoder::DecoderOptions {
-            prefer_hw: cfg.hardware_decode,
+            kind: cfg.decoder,
             threads: cfg.decode_threads,
+            vaapi_device: cfg.vaapi_device.clone(),
         };
         let sync = cfg.sync_tiles;
         spawn(threads, "decoder", move || media::decoder(shared, dec_rx, fb, opts, sync));
