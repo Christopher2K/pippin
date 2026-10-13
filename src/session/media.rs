@@ -650,7 +650,10 @@ impl DecodeLoop {
             self.awaiting_idr = false;
             self.params.write(&mut annexb);
         }
-        for nal in au.nalus.iter().filter(|n| !(irap && self.codec.is_param_set(n))) {
+        // H.264 parameter sets only ever come from `params`, so an in-band
+        // SPS can't undo the reference-count patch.
+        let drop_params = irap || self.codec == Codec::H264;
+        for nal in au.nalus.iter().filter(|n| !(drop_params && self.codec.is_param_set(n))) {
             push_annexb(&mut annexb, nal);
         }
 
@@ -798,6 +801,8 @@ pub(super) fn decoder(shared: Arc<Shared>, rx: Receiver<DecoderMsg>, fb: Sender<
                 // whatever SPS comes first is the current one.
                 st.params = ParamSets::new(st.codec);
                 st.active_sps = None;
+                st.sps_changed = None;
+                st.geometry_seen = st.shared.geometry_changed.load(Ordering::Relaxed);
                 st.config_wait = None;
                 st.restart(false);
             }
