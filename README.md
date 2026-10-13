@@ -95,8 +95,6 @@ limit, raise it so frames aren't dropped:
 sudo sysctl -w net.core.rmem_max=8388608
 ```
 
-Some software, such as Syncthing, already raises this for you.
-
 ## Limitations
 
 - No audio.
