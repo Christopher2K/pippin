@@ -87,6 +87,7 @@ src/
   rtp/        media transport (pure)
     srtp        SRTP/SRTCP (AES-CM + HMAC-SHA1-80)
     rtcp        RR/SR, FIR/PLI, NACK, LTR acks
+    stats       RFC 3550 receiver statistics (loss, jitter) for RRs
     hevc        RFC 7798 depayloading with DONL
     assembler   access-unit assembly, SSRC → tile mapping
   video/      libavcodec decoder (bindgen FFI, CUDA or software)

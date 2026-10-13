@@ -113,7 +113,9 @@ impl SrtpReceiver {
         Self { keys: SessionKeys::derive(blob, false), states: HashMap::new() }
     }
 
-    /// Extended highest sequence number seen for `ssrc` (for receiver reports).
+    /// Extended highest sequence number seen for `ssrc`. Receiver reports
+    /// use `rtp::stats` instead; this checks the rollover tracking in tests.
+    #[cfg(test)]
     pub fn extended_seq(&self, ssrc: u32) -> Option<u32> {
         self.states.get(&ssrc).map(|s| (s.roc << 16) | s.max_seq as u32)
     }

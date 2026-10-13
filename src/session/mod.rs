@@ -32,6 +32,7 @@ use crate::proto::handshake::{self, ConnectParams, SessionMode};
 use crate::proto::messages::{self, DisplayRequest};
 use crate::proto::offers::MediaOffer;
 use crate::proto::record::RecordSealer;
+use crate::rtp::stats::ReceiverStats;
 use crate::video::decoder::Picture;
 
 pub use media::Feedback;
@@ -183,7 +184,8 @@ pub struct Shared {
     /// When the media session was last re-offered (resize).
     renegotiated: AtomicU64,
     tile_ssrcs: Mutex<Vec<u32>>,
-    extended_seqs: Mutex<HashMap<u32, u32>>,
+    /// RTCP receiver statistics per tile SSRC, for receiver reports.
+    rx_stats: Mutex<HashMap<u32, ReceiverStats>>,
     sender_reports: Mutex<HashMap<u32, (u32, Instant)>>,
     canvas: Mutex<Option<(u32, u32)>>,
     /// The control connection while the handshake runs, for shutdown().
@@ -236,7 +238,7 @@ impl Session {
             last_frame: AtomicU64::new(0),
             renegotiated: AtomicU64::new(0),
             tile_ssrcs: Mutex::new(Vec::new()),
-            extended_seqs: Mutex::new(HashMap::new()),
+            rx_stats: Mutex::new(HashMap::new()),
             sender_reports: Mutex::new(HashMap::new()),
             canvas: Mutex::new(None),
             connecting: Mutex::new(None),
