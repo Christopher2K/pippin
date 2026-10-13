@@ -82,6 +82,8 @@ struct Dialog {
     /// Answer for the host and user as of the last lookup. Refreshed when
     /// those fields lose focus, not per frame, since it's a D-Bus call.
     saved: bool,
+    /// Whether the keyring works; the save checkbox is hidden without one.
+    keyring: bool,
 }
 
 impl Dialog {
@@ -182,7 +184,9 @@ impl Dialog {
             if self.saved && f.password.is_empty() {
                 ui.weak("Saved password will be used");
             }
-            ui.checkbox(&mut f.save, "Save password in keyring");
+            if self.keyring {
+                ui.checkbox(&mut f.save, "Save password in keyring");
+            }
             if let Some(e) = &self.error {
                 ui.add_space(4.0);
                 ui.colored_label(ui.visuals().error_fg_color, e);
@@ -330,11 +334,13 @@ impl ApplicationHandler<Tagged> for Dialog {
 /// (returns `None`). `error` is shown under the fields, e.g. after the host
 /// rejected the previous attempt.
 /// `has_saved` tells whether a password is stored for a host and user; an
-/// empty password field may then be submitted.
+/// empty password field may then be submitted. `keyring` false hides the
+/// save checkbox.
 pub fn run(
     el: &mut EventLoop<Tagged>,
     fields: Fields,
     error: Option<String>,
+    keyring: bool,
     has_saved: impl Fn(&str, &str) -> bool + 'static,
 ) -> Result<Option<Fields>> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle_from_env(Box::new(
@@ -352,6 +358,7 @@ pub fn run(
         repaint_at: None,
         has_saved: Box::new(has_saved),
         saved: false,
+        keyring,
     };
     app.refresh_saved();
     el.run_app_on_demand(&mut app)?;

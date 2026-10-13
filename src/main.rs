@@ -236,7 +236,10 @@ fn run() -> Result<()> {
             let p = rpassword::prompt_password(format!("Password for {u}@{h}: "))?;
             // Asked up front, while the user is at the terminal; the password
             // is only stored once the host accepts it.
-            if !cli.save_password && credentials::confirm_save(&mut std::io::stdin().lock()) {
+            if !cli.save_password
+                && credentials::available(store.as_ref(), &credentials::account(&u, &h, cli.port))
+                && credentials::confirm_save(&mut std::io::stdin().lock())
+            {
                 save = true;
             }
             (h, u, p, credentials::Source::Prompt)
@@ -262,6 +265,11 @@ fn dialog_loop(
     };
     let mut error = None;
     let port = cli.port;
+    // Probed once: the keyring doesn't come and go while the dialog is open.
+    let keyring = credentials::available(store.as_ref(), &credentials::account(&fields.user, &fields.host, port));
+    if !keyring {
+        fields.save = false;
+    }
     let stored = |host: &str, user: &str| match store.get(&credentials::account(user, host, port)) {
         Ok(p) => p,
         Err(e) => {
@@ -274,7 +282,7 @@ fn dialog_loop(
             let store = store.clone();
             move |host: &str, user: &str| matches!(store.get(&credentials::account(user, host, port)), Ok(Some(_)))
         };
-        let Some(f) = ui::dialog::run(event_loop, fields.clone(), error.take(), has_saved)? else {
+        let Some(f) = ui::dialog::run(event_loop, fields.clone(), error.take(), keyring, has_saved)? else {
             return Ok(());
         };
         let Some((password, source)) = credentials::dialog_password(f.password.clone(), || stored(&f.host, &f.user))

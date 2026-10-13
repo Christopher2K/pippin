@@ -158,6 +158,18 @@ pub fn should_save(source: Source, save: bool, interactive: bool) -> bool {
     }
 }
 
+/// Whether the keyring answers at all; without one there is no point
+/// offering to save a password.
+pub fn available(store: &dyn Store, account: &str) -> bool {
+    match store.get(account) {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::debug!("keyring unavailable, not offering to save: {e:#}");
+            false
+        }
+    }
+}
+
 /// Asks on the terminal whether to keep the password; defaults to no.
 pub fn confirm_save(input: &mut dyn BufRead) -> bool {
     eprint!("Save password to keyring? [y/N] ");
@@ -233,6 +245,13 @@ mod tests {
         let m = Mem::default();
         m.set(ACC, p).unwrap();
         m
+    }
+
+    #[test]
+    fn available_only_when_the_keyring_answers() {
+        assert!(available(&Mem::default(), ACC));
+        assert!(available(&stored("pw"), ACC));
+        assert!(!available(&Mem { broken: true, ..Default::default() }, ACC));
     }
 
     fn no_prompt() -> Result<String> {
