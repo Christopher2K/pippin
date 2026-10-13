@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=Pippin
+Name=pippin
 GenericName=Remote Desktop
 Comment=Connect to a Mac's Screen Sharing in high-performance mode
 Exec=pippin

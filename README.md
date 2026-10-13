@@ -1,8 +1,8 @@
-# Pippin
+# pippin
 
-Pippin is a high-performance remote desktop client for the high performance
+pippin is a high-performance remote desktop client for the high performance
 mode of macOS Screen Sharing. Apple normally only offers that mode between
-two Macs; Pippin brings it to Linux.
+two Macs; pippin brings it to Linux.
 
 There's nothing to install on the Mac. Turn on Screen Sharing and connect,
 and you get sharp HEVC 4:4:4 video with the Mac's display resized to fit
@@ -46,11 +46,11 @@ install -Dm644 assets/pippin.svg ~/.local/share/icons/hicolor/scalable/apps/pipp
 To run it you'll need a GPU that wgpu supports (Vulkan or GL), and UDP
 ports 5900 and 5901 free. For sound, install
 libfdk-aac (`pacman -S libfdk-aac`, `apt install libfdk-aac2` or
-`dnf install fdk-aac`). Without it, Pippin runs fine but silently.
+`dnf install fdk-aac`). Without it, pippin runs fine but silently.
 
 ## Passwords
 
-Pippin checks these places for your password, in order:
+pippin checks these places for your password, in order:
 
 1. `--password` or the `PIPPIN_PASSWORD` environment variable
 2. stdin, if you pass `--password-stdin`
@@ -61,12 +61,12 @@ Pippin checks these places for your password, in order:
 pass show mac | ./target/release/pippin my-mac.local -u alice --password-stdin
 ```
 
-If you typed the password at a prompt, Pippin asks whether to save it to
+If you typed the password at a prompt, pippin asks whether to save it to
 the keyring (or saves it straight away with `--save-password`). It won't
 ask if no keyring is running. `--forget-password` removes a saved password.
 
 When there's no terminal, for example when launched from a `.desktop` file,
-Pippin shows a small connect dialog instead of prompting. `--dialog`
+pippin shows a small connect dialog instead of prompting. `--dialog`
 shows it even from a terminal.
 
 ## Options
@@ -87,11 +87,11 @@ shows it even from a terminal.
 
 The Mac only sends HEVC 4:4:4, which not every GPU can decode. NVIDIA
 Turing or newer (through CUDA) and Intel Ice Lake or newer (through VAAPI)
-can. AMD GPUs can't, so Pippin falls back to software decoding there; it
+can. AMD GPUs can't, so pippin falls back to software decoding there; it
 works fine but uses more CPU. To check your VAAPI driver, look for
 `VAProfileHEVCMain444` in the output of `vainfo`.
 
-By default Pippin tries CUDA first, then VAAPI, then software, moving on
+By default pippin tries CUDA first, then VAAPI, then software, moving on
 to the next if one fails.
 
 ## Slow and lossy networks
@@ -123,7 +123,7 @@ sudo sysctl -w net.core.rmem_max=8388608
 
 - Copy and paste works for text and images, but not files.
 - Linux only, on Wayland or X11.
-- IPv4 only, and only one copy of Pippin per machine, because the media
+- IPv4 only, and only one copy of pippin per machine, because the media
   ports are fixed.
 
 ## Development
@@ -150,10 +150,10 @@ For network experiments:
 
 ## Credits
 
-Pippin stands on the shoulders of
+pippin stands on the shoulders of
 [iShareScreen](https://github.com/renegadelink/iShareScreen), which 
 reverse-engineered Apple's high-performance Screen Sharing protocol. 
-Pippin is a separate implementation written in Rust.
+pippin is a separate implementation written in Rust.
 
 ## License
 
