@@ -7,7 +7,9 @@
 //!
 //! An access unit whose marker arrived with packets missing is held for a
 //! short wait so NACK retransmissions and reordered packets can fill it,
-//! instead of being given up at once (which costs a keyframe).
+//! instead of being given up at once (which costs a keyframe). A host that
+//! never retransmits makes every hold pure delay, so [`HoldPolicy`] stops
+//! holding when holds keep failing.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -50,6 +52,101 @@ pub struct AccessUnit {
     /// Complete only because a hold let retransmissions or late packets in.
     pub recovered: bool,
     pub received: Instant,
+}
+
+/// Whether access units with missing packets are held for retransmissions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum HoldMode {
+    /// Hold, but stop after 20 holds in a row are given up with none filled
+    /// (AUTO_GIVE_UP_HOLDS), and resume once a NACKed packet turns up.
+    Auto,
+    /// Always hold.
+    On,
+    /// Give up on an access unit as soon as a gap is known, so the decoder
+    /// asks for a keyframe at once.
+    Off,
+}
+
+impl HoldMode {
+    pub const ALL: [HoldMode; 3] = [HoldMode::Auto, HoldMode::On, HoldMode::Off];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            HoldMode::Auto => "auto",
+            HoldMode::On => "on",
+            HoldMode::Off => "off",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|m| m.name() == s)
+    }
+}
+
+/// Holds given up in a row, none filled, before auto mode stops holding.
+pub const AUTO_GIVE_UP_HOLDS: u32 = 20;
+
+/// Decides per session whether to hold. In auto mode, holding stops after
+/// [`AUTO_GIVE_UP_HOLDS`] holds are given up without one being filled (the
+/// host isn't answering NACKs, so each hold only adds latency before the
+/// keyframe request), and resumes when a NACKed packet arrives after all:
+/// evidence that a hold could have been filled. That packet may also have
+/// been merely reordered, which costs at most another run of failed holds.
+#[derive(Debug)]
+pub struct HoldPolicy {
+    mode: HoldMode,
+    /// Auto mode gave up on holding.
+    suspended: bool,
+    /// Holds given up since the last one filled or since holding resumed.
+    unfilled: u32,
+}
+
+impl HoldPolicy {
+    pub fn new(mode: HoldMode) -> Self {
+        Self { mode, suspended: false, unfilled: 0 }
+    }
+
+    pub fn mode(&self) -> HoldMode {
+        self.mode
+    }
+
+    pub fn holding(&self) -> bool {
+        match self.mode {
+            HoldMode::On => true,
+            HoldMode::Off => false,
+            HoldMode::Auto => !self.suspended,
+        }
+    }
+
+    /// Switches mode; auto starts over, holding.
+    pub fn set_mode(&mut self, mode: HoldMode) {
+        *self = Self::new(mode);
+    }
+
+    /// A hold ended, filled or given up.
+    fn resolved(&mut self, filled: bool) {
+        if filled {
+            self.unfilled = 0;
+            return;
+        }
+        self.unfilled = self.unfilled.saturating_add(1);
+        if self.mode == HoldMode::Auto && !self.suspended && self.unfilled >= AUTO_GIVE_UP_HOLDS {
+            self.suspended = true;
+            tracing::info!(
+                "hold: {} holds given up in a row, none filled; the host isn't retransmitting, \
+                 so gaps now go straight to a keyframe request",
+                self.unfilled
+            );
+        }
+    }
+
+    /// A packet we NACKed arrived after all.
+    fn nacked_arrived(&mut self) {
+        if self.mode == HoldMode::Auto && self.suspended {
+            tracing::info!("hold: a NACKed packet arrived; holding for retransmissions again");
+            *self = Self::new(HoldMode::Auto);
+        }
+    }
 }
 
 /// Hold outcomes since the last [`Assembler::take_stats`].
@@ -169,6 +266,7 @@ pub struct Assembler {
     stats: HoldStats,
     /// DONL of the last complete linked access unit emitted.
     last_linked_donl: Option<u16>,
+    hold: HoldPolicy,
 }
 
 impl Default for Assembler {
@@ -182,6 +280,7 @@ impl Default for Assembler {
             rtt: DEFAULT_RTT,
             stats: HoldStats::default(),
             last_linked_donl: None,
+            hold: HoldPolicy::new(HoldMode::Auto),
         }
     }
 }
@@ -216,6 +315,22 @@ impl Assembler {
 
     pub fn take_stats(&mut self) -> HoldStats {
         std::mem::take(&mut self.stats)
+    }
+
+    pub fn hold_policy(&self) -> &HoldPolicy {
+        &self.hold
+    }
+
+    pub fn set_hold_mode(&mut self, mode: HoldMode) {
+        if mode != self.hold.mode() {
+            self.hold.set_mode(mode);
+        }
+    }
+
+    /// A packet we NACKed arrived after all (a retransmission, or a late
+    /// original): evidence for the hold policy.
+    pub fn nacked_arrived(&mut self) {
+        self.hold.nacked_arrived();
     }
 
     /// Adds a packet; returns the access units it releases, in decode order.
@@ -303,6 +418,9 @@ impl Assembler {
             let gap = g.packets.len() != g.last.wrapping_sub(g.first) as usize + 1
                 || self.last_marker.get(&key.0).is_some_and(|&m| g.first != m.wrapping_add(1));
             let holding = later.is_some() && (gap || now >= g.last_at + QUIET);
+            if holding && !self.hold.holding() {
+                return Verdict::Emit { complete: false };
+            }
             return Verdict::Wait { holding };
         };
         if g.last != mseq {
@@ -317,7 +435,7 @@ impl Assembler {
         // its first slice.
         if contiguous && (starts_after_prev || whole_irap(&g.payloads())) {
             Verdict::Emit { complete: true }
-        } else if now >= marker_at + self.wait() {
+        } else if !self.hold.holding() || now >= marker_at + self.wait() {
             Verdict::Emit { complete: false }
         } else {
             Verdict::Wait { holding: true }
@@ -352,6 +470,7 @@ impl Assembler {
             } else {
                 self.stats.given_up += 1;
             }
+            self.hold.resolved(complete);
         }
         // Without a marker the end is unknown; the next group must start
         // after everything seen so far to count as contiguous. Never move
@@ -826,5 +945,86 @@ mod tests {
         // A switch moves to the other group and blacklists the first.
         assert!(m.try_adopt(4, true).is_some());
         assert_eq!(m.ssrcs(), &[10, 11, 12, 13]);
+    }
+
+    /// One AU on SSRC 5 whose middle packet is lost, held and given up.
+    fn failed_hold(a: &mut Assembler, base: u16, t: Instant) {
+        assert!(a.push(pkt(5, base, base as u32, false, single(1)), t).is_empty());
+        assert!(a.push(pkt(5, base + 2, base as u32, true, single(1)), t).is_empty());
+        assert_eq!(order(&a.evict(t + a.wait())), vec![(5, false)]);
+    }
+
+    #[test]
+    fn auto_hold_stops_after_failed_holds_and_resumes() {
+        let t0 = Instant::now();
+        let mut a = Assembler::default();
+        assert!(one(a.push(pkt(5, 9, 0, true, single(19)), t0)).complete);
+        let mut seq = 10;
+        for _ in 0..AUTO_GIVE_UP_HOLDS - 1 {
+            failed_hold(&mut a, seq, t0);
+            seq += 3;
+        }
+        assert!(a.hold_policy().holding());
+        // A fill resets the count.
+        assert!(a.push(pkt(5, seq, 1000, false, single(1)), t0).is_empty());
+        assert!(a.push(pkt(5, seq + 2, 1000, true, single(1)), t0).is_empty());
+        assert!(a.evict(t0).is_empty());
+        assert!(one(a.push(pkt(5, seq + 1, 1000, false, single(1)), t0)).complete);
+        seq += 3;
+        for _ in 0..AUTO_GIVE_UP_HOLDS - 1 {
+            failed_hold(&mut a, seq, t0);
+            seq += 3;
+        }
+        assert!(a.hold_policy().holding());
+        failed_hold(&mut a, seq, t0);
+        seq += 3;
+        assert!(!a.hold_policy().holding());
+        let s = a.take_stats();
+        assert_eq!((s.filled, s.given_up), (1, 2 * AUTO_GIVE_UP_HOLDS - 1));
+
+        // Not holding: a gap is given up at once, without counting a hold.
+        assert!(a.push(pkt(5, seq, 2000, false, single(1)), t0).is_empty());
+        assert_eq!(order(&a.push(pkt(5, seq + 2, 2000, true, single(1)), t0)), vec![(5, false)]);
+        assert_eq!(a.take_stats().started, 0);
+        // Nor does it hold up the next access unit.
+        assert!(one(a.push(pkt(5, seq + 3, 2001, true, single(1)), t0)).complete);
+
+        // A NACKed packet turning up brings holding back.
+        a.nacked_arrived();
+        assert!(a.hold_policy().holding());
+        seq += 4;
+        assert!(a.push(pkt(5, seq, 3000, false, single(1)), t0).is_empty());
+        assert!(a.push(pkt(5, seq + 2, 3000, true, single(1)), t0).is_empty());
+        assert_eq!(a.take_stats().started, 1);
+    }
+
+    #[test]
+    fn fixed_hold_modes() {
+        let t0 = Instant::now();
+        let mut on = Assembler::default();
+        on.set_hold_mode(HoldMode::On);
+        assert!(one(on.push(pkt(5, 9, 0, true, single(19)), t0)).complete);
+        for i in 0..AUTO_GIVE_UP_HOLDS * 2 {
+            failed_hold(&mut on, 10 + i as u16 * 3, t0);
+        }
+        assert!(on.hold_policy().holding());
+
+        let mut off = Assembler::default();
+        off.set_hold_mode(HoldMode::Off);
+        assert!(!off.hold_policy().holding());
+        off.nacked_arrived();
+        assert!(!off.hold_policy().holding());
+        // A tile whose marker was lost is given up as soon as later traffic
+        // shows it ended, without the hold.
+        off.link(&[10, 11]);
+        assert!(off.push(pkt(10, 1, 1, false, slice(100)), t0).is_empty());
+        assert!(off.push(pkt(10, 3, 2, false, slice(102)), t0).is_empty());
+        assert!(off.evict(t0).is_empty());
+        let aus = off.evict(t0 + QUIET);
+        assert_eq!(order(&aus), vec![(10, false)]);
+
+        for m in HoldMode::ALL {
+            assert_eq!(HoldMode::parse(m.name()), Some(m));
+        }
     }
 }

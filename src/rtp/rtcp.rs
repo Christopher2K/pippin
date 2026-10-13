@@ -62,20 +62,86 @@ pub fn empty_sender_report(sender: u32) -> Vec<u8> {
     out
 }
 
-/// AVPF FIR + PLI + the legacy RFC 2032 FIR that screensharingd honors most
-/// reliably, prefixed with an empty RR to form a compound packet.
-pub fn keyframe_request(sender: u32, target: u32, fir_seq: u8) -> Vec<u8> {
-    let mut out = receiver_report(sender, &[]);
+/// Which keyframe-recovery feedback to send when a tile loses a picture.
+///
+/// Known about the host (from iShareScreen, the protocol reference):
+/// * The native viewer sends only the legacy RFC 2032 FIR (PT 192), and
+///   screensharingd answers it with a fresh IDR. It "often ignores" the AVPF
+///   FIR (PT 206 FMT 4), so [`Recovery::Fir`] sends both FIR forms.
+/// * The reference always sends FIR + PLI + legacy FIR together, so which
+///   of them the host acts on has never been measured apart.
+///
+/// Unknown (to be measured with `--stats-json`):
+/// * Whether the host answers a PLI (PT 206 FMT 1) at all, and if so with an
+///   IDR or with a P picture predicted from the last long-term reference we
+///   acknowledged (see [`ltr_ack`]). RFC 4585 leaves the response to the
+///   encoder; with LTR negotiated the cheap answer would be an LTR-referenced
+///   P picture instead of a keyframe. The decoder currently drops everything
+///   until an IRAP after a loss, so such an answer would not show up as a
+///   faster recovery yet.
+/// * Whether the compound costs more than a single request (e.g. two IDRs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum Recovery {
+    /// AVPF FIR and the legacy RFC 2032 FIR.
+    Fir,
+    /// Picture Loss Indication only.
+    Pli,
+    /// AVPF FIR + PLI + legacy FIR, as the reference sends.
+    #[value(name = "fir+pli")]
+    FirPli,
+}
+
+impl Recovery {
+    pub const ALL: [Recovery; 3] = [Recovery::Fir, Recovery::Pli, Recovery::FirPli];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Recovery::Fir => "fir",
+            Recovery::Pli => "pli",
+            Recovery::FirPli => "fir+pli",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|r| r.name() == s)
+    }
+}
+
+/// AVPF Full Intra Request (RFC 5104 4.3.1.1).
+fn fir(out: &mut Vec<u8>, sender: u32, target: u32, fir_seq: u8) {
     out.extend_from_slice(&[0x84, 206, 0, 4]);
     out.extend_from_slice(&sender.to_be_bytes());
     out.extend_from_slice(&0u32.to_be_bytes());
     out.extend_from_slice(&target.to_be_bytes());
     out.extend_from_slice(&[fir_seq, 0, 0, 0]);
+}
+
+/// Picture Loss Indication (RFC 4585 6.3.1).
+fn pli(out: &mut Vec<u8>, sender: u32, target: u32) {
     out.extend_from_slice(&[0x81, 206, 0, 2]);
     out.extend_from_slice(&sender.to_be_bytes());
     out.extend_from_slice(&target.to_be_bytes());
+}
+
+/// The legacy RFC 2032 FIR the native viewer sends.
+fn legacy_fir(out: &mut Vec<u8>, target: u32) {
     out.extend_from_slice(&[0x80, 192, 0, 1]);
     out.extend_from_slice(&target.to_be_bytes());
+}
+
+/// A keyframe request of the given kind, prefixed with an empty RR to form
+/// a compound packet.
+pub fn recovery_request(kind: Recovery, sender: u32, target: u32, fir_seq: u8) -> Vec<u8> {
+    let mut out = receiver_report(sender, &[]);
+    if kind != Recovery::Pli {
+        fir(&mut out, sender, target, fir_seq);
+    }
+    if kind != Recovery::Fir {
+        pli(&mut out, sender, target);
+    }
+    if kind != Recovery::Pli {
+        legacy_fir(&mut out, target);
+    }
     out
 }
 
@@ -246,8 +312,33 @@ mod tests {
 
     #[test]
     fn empty_rr_for_feedback() {
-        let p = keyframe_request(9, 2, 1);
-        assert_eq!(&p[..8], &[0x80, 201, 0, 1, 0, 0, 0, 9]);
+        for kind in Recovery::ALL {
+            let p = recovery_request(kind, 9, 2, 1);
+            assert_eq!(&p[..8], &[0x80, 201, 0, 1, 0, 0, 0, 9]);
+        }
+    }
+
+    #[test]
+    fn recovery_variants_layout() {
+        let rr: &[u8] = &[0x80, 201, 0, 1, 0, 0, 0, 9];
+        let fir: &[u8] = &[0x84, 206, 0, 4, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 2, 7, 0, 0, 0];
+        let pli: &[u8] = &[0x81, 206, 0, 2, 0, 0, 0, 9, 0, 0, 0, 2];
+        let legacy: &[u8] = &[0x80, 192, 0, 1, 0, 0, 0, 2];
+        assert_eq!(recovery_request(Recovery::Fir, 9, 2, 7), [rr, fir, legacy].concat());
+        assert_eq!(recovery_request(Recovery::Pli, 9, 2, 7), [rr, pli].concat());
+        assert_eq!(recovery_request(Recovery::FirPli, 9, 2, 7), [rr, fir, pli, legacy].concat());
+        for kind in Recovery::ALL {
+            // Each part's length field matches its size, so the compound
+            // splits cleanly.
+            let p = recovery_request(kind, 9, 2, 7);
+            let mut pos = 0;
+            while pos < p.len() {
+                pos += (u16::from_be_bytes([p[pos + 2], p[pos + 3]]) as usize + 1) * 4;
+            }
+            assert_eq!(pos, p.len());
+            assert_eq!(Recovery::parse(kind.name()), Some(kind));
+        }
+        assert_eq!(Recovery::parse("idr"), None);
     }
 
     #[test]

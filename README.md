@@ -30,7 +30,28 @@ client window.
   (NV12/NV24 and packed VUYX included) and are converted in the shader.
 - **Loss recovery.** NACKs (retried once), with frames that have holes held
   briefly for the retransmission; keyframe requests, long-term-reference
-  acks, and stall detection.
+  acks, and stall detection. `--hold auto` (default) stops holding once 20
+  holds in a row go unfilled, since a host that doesn't retransmit makes
+  each hold pure delay; `on`/`off` fix it. `--recovery fir|pli|fir+pli`
+  picks the keyframe request, `--ltr on|off` long-term references, and
+  `--fps 60|30` the offered frame rate.
+
+## Experiments
+
+`--stats-json stats.jsonl` appends one JSON object per second: the
+operating point, packet and byte rates, per-tile loss and jitter, NACKs,
+holds, keyframe requests by kind, keyframe sizes, recovery latency, frozen
+time, decode times, presented frames and round trip. Each field is
+documented in `src/session/metrics.rs`.
+
+For switching levers mid-session without a GUI, set
+`MACSHARE_CONTROL_FIFO=/tmp/macshare.ctl` (created as a FIFO if missing) and
+write commands to it, e.g. `echo 'hold off' > /tmp/macshare.ctl`:
+`render_scale 1|0.5`, `fps 60|30`, `recovery fir|pli|fir+pli`,
+`hold auto|on|off`, `ltr on|off`, `keyframe` (ask for one now) and
+`restart` (reconnect with the current settings). `recovery` and `hold`
+apply at once; `render_scale` re-requests the display like a resize; `fps`
+and `ltr` re-offer the media session on the open connection.
 
 ## Requirements
 

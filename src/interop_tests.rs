@@ -53,7 +53,7 @@ fn srtp_matches_reference() {
 
 #[test]
 fn rtcp_matches_reference() {
-    assert_eq!(rtcp::keyframe_request(OURS, MEDIA, 7), hex(KEYFRAME));
+    assert_eq!(rtcp::recovery_request(rtcp::Recovery::FirPli, OURS, MEDIA, 7), hex(KEYFRAME));
     assert_eq!(rtcp::nack(OURS, MEDIA, &[100, 101, 103, 117, 140]).unwrap(), hex(NACK));
     assert_eq!(rtcp::ltr_ack(OURS, 0x1234), hex(LTR));
 }

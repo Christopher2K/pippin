@@ -12,7 +12,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 
 use super::{Event, Shared};
 use crate::proto::offers::{MediaOffer, SRTP_BLOB_LEN};
-use crate::rtp::assembler::{AccessUnit, Assembler, POLL_EVERY, TileMap};
+use crate::rtp::assembler::{AccessUnit, Assembler, HoldStats, POLL_EVERY, TileMap};
 use crate::rtp::srtp::{SrtcpReceiver, SrtcpSender, SrtpReceiver, SrtpSender};
 use crate::rtp::stats::{ReceiverStats, VIDEO_CLOCK_HZ};
 use crate::rtp::{hevc, rtcp};
@@ -72,7 +72,7 @@ fn record_sender_reports(shared: &Shared, rtcp: &[u8]) {
             srs.insert(ssrc, (mid32, now));
         }
     }
-    let Some(ours) = shared.control.get().map(|c| c.offer.video_ssrc) else {
+    let Some(ours) = shared.control.get().map(|c| c.video_ssrc) else {
         return;
     };
     let samples = rtcp::round_trips(rtcp, ours, rtcp::ntp_middle_now());
@@ -141,18 +141,26 @@ struct LossStats {
     since: Instant,
     nacked: u32,
     retried: u32,
+    holds: HoldStats,
 }
 
 impl LossStats {
     fn new() -> Self {
-        Self { since: Instant::now(), nacked: 0, retried: 0 }
+        Self { since: Instant::now(), nacked: 0, retried: 0, holds: HoldStats::default() }
     }
 
-    fn log_if_due(&mut self, shared: &Shared, asm: &mut Assembler) {
+    fn add_holds(&mut self, h: HoldStats) {
+        self.holds.started += h.started;
+        self.holds.filled += h.filled;
+        self.holds.given_up += h.given_up;
+        self.holds.donl_backwards += h.donl_backwards;
+    }
+
+    fn log_if_due(&mut self, shared: &Shared, asm: &Assembler) {
         if self.since.elapsed() < STATS_EVERY {
             return;
         }
-        let holds = asm.take_stats();
+        let holds = self.holds;
         let damaged = shared.recovered_damaged.swap(0, Ordering::Relaxed);
         if self.nacked > 0 || holds.started > 0 || holds.donl_backwards > 0 {
             let rtt = match *shared.rtt.lock() {
@@ -161,7 +169,7 @@ impl LossStats {
             };
             tracing::debug!(
                 "loss: {} NACKed, {} retried; holds {} started, {} filled ({damaged} pictures damaged after), \
-                 {} given up; DONL backwards {}; rtt {rtt}, hold {} ms",
+                 {} given up; DONL backwards {}; rtt {rtt}, hold {} ms{}",
                 self.nacked,
                 self.retried,
                 holds.started,
@@ -169,6 +177,7 @@ impl LossStats {
                 holds.given_up,
                 holds.donl_backwards,
                 asm.wait().as_millis(),
+                if asm.hold_policy().holding() { "" } else { " (not holding)" },
             );
         }
         *self = Self::new();
@@ -197,6 +206,8 @@ pub(super) fn video_rx(
     let mut last_adopt = Instant::now();
     let mut bad = 0u64;
     let mut seen = std::collections::HashSet::new();
+    asm.set_hold_mode(shared.op().hold);
+    shared.metrics.holding.store(asm.hold_policy().holding(), Ordering::Relaxed);
 
     while !shared.stopped() {
         match sock.recv_from(&mut buf) {
@@ -208,19 +219,28 @@ pub(super) fn video_rx(
                     }
                 } else if let Some(p) = srtp.unprotect(pkt) {
                     shared.touch(&shared.last_video_packet);
+                    shared.metrics.video_packets.fetch_add(1, Ordering::Relaxed);
+                    shared.metrics.video_bytes.fetch_add(n as u64, Ordering::Relaxed);
                     if seen.insert(p.ssrc) {
                         tracing::debug!("new video SSRC {:#010x} (pt {})", p.ssrc, p.pt);
                     }
                     tiles.count_packet(p.ssrc);
-                    if tiles.tile_of(p.ssrc).is_some() {
+                    if let Some(tile) = tiles.tile_of(p.ssrc) {
+                        shared.metrics.tile_packet(tile, shared.clock.now_ms());
                         // Gap detection for NACKs; the assembler deals with order.
-                        nacked.remove(&(p.ssrc, p.seq));
+                        if nacked.remove(&(p.ssrc, p.seq)).is_some() {
+                            // A retransmission, or a late original: either
+                            // way a hold could have been filled.
+                            shared.metrics.nacked_arrived.fetch_add(1, Ordering::Relaxed);
+                            asm.nacked_arrived();
+                        }
                         let expected = *next_seq.entry(p.ssrc).or_insert(p.seq);
                         let gap = p.seq.wrapping_sub(expected);
                         if gap < 0x8000 {
                             if gap > 0 && gap < NACK_MAX_GAP {
                                 let lost: Vec<u16> = (0..gap).map(|i| expected.wrapping_add(i)).collect();
                                 loss.nacked += lost.len() as u32;
+                                shared.metrics.nacked.fetch_add(lost.len() as u64, Ordering::Relaxed);
                                 if nacked.len() < NACK_PENDING_MAX {
                                     let now = Instant::now();
                                     nacked.extend(lost.iter().map(|&s| ((p.ssrc, s), (now, false))));
@@ -261,13 +281,20 @@ pub(super) fn video_rx(
             if let Some(rtt) = *shared.rtt.lock() {
                 asm.set_rtt(rtt);
             }
+            asm.set_hold_mode(shared.op().hold);
             // Given-up access units come out incomplete; the decoder asks
             // for the keyframe.
             if !route(&mut tiles, &dec, asm.evict(now)) {
                 return;
             }
-            loss.retried += retry_nacks(&mut nacked, asm.retry_after(), asm.wait(), now, &fb);
-            loss.log_if_due(&shared, &mut asm);
+            let retried = retry_nacks(&mut nacked, asm.retry_after(), asm.wait(), now, &fb);
+            loss.retried += retried;
+            shared.metrics.nack_retries.fetch_add(retried as u64, Ordering::Relaxed);
+            let holds = asm.take_stats();
+            loss.add_holds(holds);
+            shared.metrics.add_holds(holds);
+            shared.metrics.holding.store(asm.hold_policy().holding(), Ordering::Relaxed);
+            loss.log_if_due(&shared, &asm);
             // Wake often enough to retry and give up on time even if the
             // stream goes quiet, but not while idle.
             let busy = asm.pending() || !nacked.is_empty();
@@ -553,6 +580,11 @@ impl DecodeLoop {
             return;
         }
         let irap = au.nalus.iter().any(|n| hevc::is_irap(n));
+        if irap {
+            let m = &self.shared.metrics;
+            m.irap_aus.fetch_add(1, Ordering::Relaxed);
+            m.irap_bytes.fetch_add(au.nalus.iter().map(|n| n.len() as u64).sum(), Ordering::Relaxed);
+        }
         if self.awaiting_idr && !irap {
             return;
         }
@@ -584,7 +616,9 @@ impl DecodeLoop {
         let started = Instant::now();
         let ok = self.decoder.decode(&annexb, self.pts, &mut |p| pictures.push(p));
         let slices = au.nalus.iter().filter(|n| hevc::is_slice(n)).count();
-        self.stats.record(slices, pictures.len(), started.elapsed());
+        let took = started.elapsed();
+        self.stats.record(slices, pictures.len(), took);
+        self.shared.metrics.decoded(took);
         if !ok {
             self.awaiting_idr = true;
             let _ = self.fb.send(Feedback::Keyframe(Some(tile)));
@@ -622,6 +656,7 @@ impl DecodeLoop {
         let Some((tile, donl, recovered)) = self.origin.remove(&pic.pts) else {
             return;
         };
+        self.shared.metrics.picture(tile, !pic.damaged, self.shared.clock.now_ms(), Instant::now());
         if pic.damaged {
             if recovered {
                 self.shared.recovered_damaged.fetch_add(1, Ordering::Relaxed);
@@ -651,6 +686,7 @@ impl DecodeLoop {
         let tiles: Vec<usize> = self.batch.iter().map(|(t, _)| *t).collect();
         tracing::trace!("present tiles {tiles:?} ({why:?}, held {:.1} ms)", held.as_secs_f64() * 1000.0);
         self.gather.record(why, tiles.len(), held);
+        self.shared.metrics.presented.fetch_add(1, Ordering::Relaxed);
         if self.shared.frames.put_frame(self.batch.drain(..)) {
             self.shared.sink.emit(Event::Frame);
         }
@@ -717,6 +753,7 @@ pub(super) fn decoder(shared: Arc<Shared>, rx: Receiver<DecoderMsg>, fb: Sender<
             Err(RecvTimeoutError::Timeout) => st.flush(Flush::Idle),
             Err(RecvTimeoutError::Disconnected) => return,
         }
+        shared.metrics.awaiting_idr.store(st.awaiting_idr, Ordering::Relaxed);
     }
 }
 
@@ -791,25 +828,31 @@ impl FeedbackSender {
     }
 
     fn keyframe(&mut self, tile: Option<usize>) {
-        if self.shared.since_ms(&self.shared.last_video_packet) > IDLE_AFTER_MS {
-            return;
-        }
         let ssrcs = self.shared.tile_ssrcs.lock().clone();
         let targets: Vec<usize> = match tile {
             Some(t) => vec![t],
             None => (0..ssrcs.len()).collect(),
         };
+        let shared = self.shared.clone();
+        let metrics = &shared.metrics;
+        if self.shared.since_ms(&self.shared.last_video_packet) > IDLE_AFTER_MS {
+            metrics.keyframes_suppressed.fetch_add(targets.len() as u64, Ordering::Relaxed);
+            return;
+        }
+        let kind = self.shared.op().recovery;
         let now = Instant::now();
         for t in targets {
             let Some(&target) = ssrcs.get(t) else { continue };
             if self.last_keyframe.get(&t).is_some_and(|l| now.duration_since(*l) < KEYFRAME_MIN_INTERVAL) {
+                metrics.keyframes_suppressed.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             self.last_keyframe.insert(t, now);
             self.fir_seq = self.fir_seq.wrapping_add(1);
-            tracing::debug!("keyframe request for tile {t}");
-            let pkt = rtcp::keyframe_request(self.our_ssrc, target, self.fir_seq);
+            tracing::debug!("keyframe request ({}) for tile {t}", kind.name());
+            let pkt = rtcp::recovery_request(kind, self.our_ssrc, target, self.fir_seq);
             self.ctrl(&pkt);
+            metrics.keyframe_sent(kind, t, now);
         }
     }
 
@@ -822,7 +865,7 @@ impl FeedbackSender {
                 }
             }
             Feedback::LtrAck(donl) => {
-                if self.last_ltr != Some(donl) {
+                if self.shared.op().ltr && self.last_ltr != Some(donl) {
                     self.last_ltr = Some(donl);
                     // LTR acks go to the video port, not the control port.
                     let pkt = self.srtcp.protect(&rtcp::ltr_ack(self.our_ssrc, donl));

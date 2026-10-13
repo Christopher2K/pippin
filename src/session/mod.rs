@@ -11,13 +11,18 @@
 //! * `feedback` sends RTCP (receiver reports, keyframe requests, NACKs, LTR
 //!   acks), the audio keepalive and the cursor poll on a 500 ms tick.
 //! * `clipboard` mirrors text between the local and remote pasteboards.
+//! * `control-fifo` (debug, `MACSHARE_CONTROL_FIFO`) switches the operating
+//!   point mid-session; `stats-json` (`--stats-json`) writes metrics.
 
 mod control;
 mod media;
+mod metrics;
+mod operating;
 
 use std::collections::HashMap;
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream, UdpSocket};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -30,12 +35,13 @@ use parking_lot::Mutex;
 use crate::proto::auth::AuthError;
 use crate::proto::handshake::{self, ConnectParams, SessionMode};
 use crate::proto::messages::{self, DisplayRequest};
-use crate::proto::offers::MediaOffer;
+use crate::proto::offers::{MediaOffer, OfferOptions};
 use crate::proto::record::RecordSealer;
 use crate::rtp::stats::ReceiverStats;
 use crate::video::decoder::{DecoderKind, Picture};
 
 pub use media::Feedback;
+pub use operating::{Fps, OperatingPoint, SharedOp, parse_on_off};
 
 use crate::errors::Failure;
 
@@ -73,6 +79,13 @@ pub struct Config {
     /// likely a host still waking up than a firewall, so it's retried
     /// rather than reported as fatal.
     pub resumed: bool,
+    /// The operating point, shared with the window and kept across
+    /// reconnects.
+    pub op: SharedOp,
+    /// Append one JSON line of metrics per second here.
+    pub stats_json: Option<PathBuf>,
+    /// Debug FIFO to read operating-point commands from.
+    pub control_fifo: Option<PathBuf>,
 }
 
 pub type AuthHook = Arc<dyn Fn(bool) + Send + Sync>;
@@ -106,6 +119,9 @@ pub enum Event {
     /// The connection failed or dropped in a way a fresh session may fix
     /// (host asleep, network change, timeout).
     Lost(String),
+    /// The operating point's render scale changed; request the display
+    /// again.
+    Reconfigure,
 }
 
 pub trait EventSink: Send + Sync + 'static {
@@ -146,7 +162,11 @@ impl FrameStore {
 pub struct Control {
     writer: Mutex<(TcpStream, RecordSealer)>,
     record_key: [u8; 16],
-    offer: MediaOffer,
+    /// Our video SSRC, the one our SRs are sent as.
+    video_ssrc: u32,
+    /// The media offer, re-sent after a resize and changed by the
+    /// operating point.
+    offer: Mutex<MediaOffer>,
 }
 
 impl Control {
@@ -159,7 +179,13 @@ impl Control {
     }
 
     pub fn reoffer(&self) {
-        self.send(&self.offer.message());
+        let msg = self.offer.lock().message();
+        self.send(&msg);
+    }
+
+    /// Changes the offer the next [`reoffer`](Self::reoffer) sends.
+    pub fn set_offer_options(&self, opts: OfferOptions) {
+        self.offer.lock().set_options(opts);
     }
 }
 
@@ -200,6 +226,8 @@ pub struct Shared {
     connecting: Mutex<Option<TcpStream>>,
     /// Clones of the media sockets, so shutdown() can wake their readers.
     udp: Mutex<Vec<UdpSocket>>,
+    op: SharedOp,
+    metrics: metrics::Metrics,
 }
 
 impl Shared {
@@ -213,6 +241,15 @@ impl Shared {
 
     fn touch(&self, stamp: &AtomicU64) {
         stamp.store(self.clock.now_ms(), Ordering::Relaxed);
+    }
+
+    /// The current operating point.
+    fn op(&self) -> OperatingPoint {
+        *self.op.lock()
+    }
+
+    fn op_handle(&self) -> &SharedOp {
+        &self.op
     }
 
     fn set_canvas(&self, w: u32, h: u32) {
@@ -253,6 +290,8 @@ impl Session {
             canvas: Mutex::new(None),
             connecting: Mutex::new(None),
             udp: Mutex::new(Vec::new()),
+            op: cfg.op.clone(),
+            metrics: metrics::Metrics::default(),
         });
         let threads = Arc::new(Mutex::new(Vec::new()));
         let session = Session { shared: shared.clone(), threads: threads.clone() };
@@ -466,6 +505,7 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
         session_mode: cfg.session_mode,
         display,
         audio: false,
+        offer: shared.op().offer_options(),
         on_open: Some(Box::new({
             let shared = shared.clone();
             move |s: &TcpStream| {
@@ -518,7 +558,8 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
     let control = Arc::new(Control {
         writer: Mutex::new((neg.stream, neg.sealer)),
         record_key: neg.record_key,
-        offer: neg.offer.clone(),
+        video_ssrc: neg.offer.video_ssrc,
+        offer: Mutex::new(neg.offer.clone()),
     });
     let _ = shared.control.set(control.clone());
     // shutdown() may have run between the check above and the set, seen no
@@ -561,6 +602,14 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
     {
         let (shared, control) = (shared.clone(), control.clone());
         spawn(threads, "clipboard", move || crate::clipboard::run(shared, control, clip_rx));
+    }
+    if let Some(path) = cfg.control_fifo.clone() {
+        let (shared, fb) = (shared.clone(), fb_tx.clone());
+        spawn(threads, "control-fifo", move || operating::control_fifo(shared, path, fb));
+    }
+    if let Some(path) = cfg.stats_json.clone() {
+        let shared = shared.clone();
+        spawn(threads, "stats-json", move || metrics::writer(shared, path));
     }
 
     // Subscribe to pasteboard changes and prime with the current contents.

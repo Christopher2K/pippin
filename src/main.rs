@@ -18,6 +18,7 @@ mod video;
 
 use std::io::{BufRead, IsTerminal};
 use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -25,6 +26,9 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 
 use proto::handshake::SessionMode;
+use rtp::assembler::HoldMode;
+use rtp::rtcp::Recovery;
+use session::Fps;
 use video::decoder::DecoderKind;
 
 #[derive(Parser)]
@@ -73,6 +77,26 @@ struct Cli {
     /// renders whole scales, so 0.5 needs a Retina (2x) window.
     #[arg(long, default_value_t = 1.0)]
     render_scale: f64,
+    /// Frame rate to offer. 30 clears the host's 60 fps stream flags:
+    /// fewer pictures to lose and decode on a bad link.
+    #[arg(long, value_enum, default_value_t = Fps::Sixty)]
+    fps: Fps,
+    /// Keyframe request sent when a tile loses a picture: FIR (AVPF and
+    /// legacy), PLI, or all three together.
+    #[arg(long, value_enum, default_value_t = Recovery::FirPli)]
+    recovery: Recovery,
+    /// Hold frames with missing packets for NACK retransmissions. auto stops
+    /// holding when the host doesn't retransmit.
+    #[arg(long, value_enum, default_value_t = HoldMode::Auto)]
+    hold: HoldMode,
+    /// Long-term reference pictures: offer them and acknowledge clean
+    /// frames, so the host may recover from loss without a keyframe.
+    #[arg(long, default_value = "on", value_name = "on|off", action = clap::ArgAction::Set, value_parser = session::parse_on_off)]
+    ltr: bool,
+    /// Append one JSON line of link and recovery metrics per second to this
+    /// file, for experiments.
+    #[arg(long)]
+    stats_json: Option<PathBuf>,
     /// Keep the remote resolution fixed instead of following the window.
     #[arg(long)]
     no_auto_resize: bool,
@@ -329,13 +353,23 @@ fn connect(
         warmup: !cli.no_warmup,
         on_auth: Some(on_auth),
         resumed: false,
+        op: Arc::new(parking_lot::Mutex::new(session::OperatingPoint {
+            render_scale: cli.render_scale,
+            fps: cli.fps,
+            recovery: cli.recovery,
+            hold: cli.hold,
+            ltr: cli.ltr,
+        })),
+        stats_json: cli.stats_json.clone(),
+        // Debug only: switch operating-point levers mid-session by writing
+        // lines such as `fps 30` or `hold off` to this FIFO.
+        control_fifo: std::env::var_os("MACSHARE_CONTROL_FIFO").map(PathBuf::from),
     };
     let opts = ui::Options {
         title: format!("{host_name} — macshare"),
         host_name: host_name.to_owned(),
         size: cli.size,
         scale: cli.scale,
-        render_scale: cli.render_scale,
         auto_resize: !cli.no_auto_resize,
         swap_ctrl_cmd: cli.swap_ctrl_cmd,
         reconnect: !cli.no_reconnect,
