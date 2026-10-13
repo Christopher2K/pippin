@@ -36,15 +36,33 @@ client window.
   pictures until the next keyframe, freezing the picture; `conceal` keeps
   decoding what arrived, so it keeps moving but smeared until then.
 
+## Lossy networks
+
+Measured against a real Mac:
+
+- The Mac does not retransmit video. Across hundreds of NACKs, none of the
+  NACKed packets arrived within 1 s.
+- So every loss costs a keyframe (about 57 KB), and at 1% packet loss the
+  picture is frozen about half the time with the defaults.
+- FIR vs PLI, long-term references off, 30 fps and `--scale` made no
+  measurable difference.
+- `--after-loss conceal` turns about a fifth of the frozen time into
+  moving but smeared video.
+- `--render-scale 0.5` is the lever for slow links: on a Retina window the
+  Mac renders and streams a quarter of the pixels, so keyframes are smaller,
+  at the cost of softer text. macOS only renders whole scales, so it needs
+  a 2x window.
+
 ## Experiments
 
 `--stats-json stats.jsonl` appends one JSON object per second: the
-operating point and what the host answered (canvas, LTR, per-tile picture
-rate), packet and byte rates, per-tile loss before and after repair and
-jitter, NACKs and how fast retransmissions arrive, holds, keyframe requests
-by kind and by cause, keyframe sizes, recovery time per loss outage, frozen
-and concealed time, decode times, presented frames and round trip. Each field is
-documented in `src/session/metrics.rs`.
+operating point (including the decoder in use) and what the host answered
+(canvas, LTR, per-tile picture rate), packet and byte rates, per-tile loss
+before and after repair and jitter, NACKs and how fast retransmissions
+arrive, holds, keyframe requests by kind and by cause, keyframe sizes,
+recovery time per loss outage, frozen and concealed time, decode times,
+presented frames and round trip. Each field is documented in
+`src/session/metrics.rs`.
 
 For switching levers mid-session without a GUI, set
 `MACSHARE_CONTROL_FIFO=/tmp/macshare.ctl` (created as a FIFO if missing) and
@@ -74,6 +92,9 @@ re-offer the media session on the open connection.
   for the account you log in with.
 - UDP ports 5900 and 5901 free locally. The host sends media to them.
 - A large socket receive buffer. Video bursts overflow the kernel default:
+  at 4K under heavy motion the queue peaked at 667 KB (no drops with
+  `rmem_max` at 7 MB), more than the stock ~416 KB effective buffer holds.
+  The client asks for 8 MB and warns if it gets less than 2 MB:
 
   ```sh
   sudo sysctl -w net.core.rmem_max=33554432
@@ -94,7 +115,9 @@ The password is taken from `--password`/`MACSHARE_PASSWORD`, then
 `Save password to keyring? [y/N]` (it is stored only once the Mac accepts it), and `--save-password` saves any working
 password without asking. A stored password the host rejects is removed so the
 next run prompts.
-`--forget-password` deletes the stored entry and exits.
+`--forget-password` deletes the stored entry and exits. Without a working
+keyring nothing offers to save: the terminal question is skipped and the
+dialog hides its checkbox.
 
 Without a terminal (e.g. launched from a `.desktop` file), a missing host,
 user or password is asked for in a small connect dialog instead; the host and
@@ -151,8 +174,7 @@ frames instead of building a queue.
   silent keepalive.
 - Text-only clipboard. No images or files.
 - IPv4 only. One client per machine, because the media ports are fixed.
-- Only tested by unit tests and interop vectors so far; not yet run against
-  a real Mac.
+- Poor on lossy links; see [Lossy networks](#lossy-networks).
 
 ## Tests
 
