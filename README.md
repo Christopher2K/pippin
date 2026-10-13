@@ -1,127 +1,111 @@
 # pippin
 
-pippin is a high-performance remote desktop client for the high performance
-mode of macOS Screen Sharing. Apple normally only offers that mode between
-two Macs; pippin brings it to Linux.
+`pippin` brings macOS High-Performance Screen Sharing to Linux. 
 
-There's nothing to install on the Mac. Turn on Screen Sharing and connect,
-and you get sharp HEVC 4:4:4 video with the Mac's display resized to fit
-your window, plus the Mac's sound. Text and images copy and paste in both
-directions, the cursor is drawn locally so it never lags behind your
-mouse, and video is decoded on the GPU whenever possible.
+Normally reserved for Mac-to-Mac connections, Apple's high-performance mode delivers low-latency, color-accurate remote desktop sessions. `pippin` is a native Rust client that connects directly to your Mac's built-in screen sharing server—no third-party software required on macOS.
 
-## Quick start
+### Features
+* **Crisp Video & Audio:** Streams sharp HEVC 4:4:4 video with system audio.
+* **Dynamic Display:** Automatically resizes the Mac's resolution to fit your Linux window.
+* **Zero-Lag Cursor:** Renders the cursor locally so mouse movement always feels instant.
+* **GPU-Accelerated:** Uses hardware decoding via CUDA or VAAPI whenever supported.
+* **Two-Way Clipboard:** Copy and paste text and images seamlessly between Linux and macOS.
 
-High-performance mode needs an Apple silicon Mac running macOS Sonoma or
-later. On the Mac, turn on System Settings → General → Sharing → Screen
-Sharing. Then install pippin on Linux and run:
+## Requirements
+
+* **Host (Mac):** Apple Silicon running macOS Sonoma (14.0) or later.
+* **Client (Linux):** X11 or Wayland with a `wgpu`-supported GPU (Vulkan or OpenGL).
+* **Network:** IPv4 with UDP ports `5900` and `5901` open.
+* **Audio (Optional):** Install `libfdk-aac` (`pacman -S libfdk-aac`, `apt install libfdk-aac2`, or `dnf install fdk-aac`). Without it, `pippin` runs silently.
+
+## Quick Start
+
+1. On your Mac, enable **System Settings → General → Sharing → Screen Sharing**.
+2. On Linux, install `pippin` (see below) and connect:
 
 ```sh
 pippin my-mac.local -u alice
 ```
 
-## Installing
+## Installation
 
-On Arch, install [`pippin`](https://aur.archlinux.org/packages/pippin)
-(latest release) or [`pippin-git`](https://aur.archlinux.org/packages/pippin-git)
-(latest commit) from the AUR:
+### Arch Linux (AUR)
+Install `pippin` (latest release) or `pippin-git` (latest commit) using your preferred AUR helper:
 
 ```sh
 yay -S pippin
 ```
 
-Everywhere else, install with cargo. You'll need Rust 1.95 or newer
-(distro packages are often older; use [rustup](https://rustup.rs)), plus
-clang, pkg-config, FFmpeg's development headers and ALSA:
+### Cargo (All Other Distros)
+Building from source requires **Rust 1.95 or newer** (use [rustup](https://rustup.rs) if your distro's package is older), along with `clang`, `pkg-config`, FFmpeg development headers, and ALSA:
 
 ```sh
 # Debian 13 / Ubuntu 24.04
 sudo apt install build-essential pkg-config clang libclang-dev libavcodec-dev libavutil-dev libasound2-dev
+
 # Fedora
 sudo dnf install gcc pkgconf-pkg-config clang clang-devel libavcodec-free-devel libavutil-free-devel alsa-lib-devel
-
-cargo install --locked --git https://github.com/jonesy827/pippin
 ```
 
-cargo installs only the binary. To launch pippin from your desktop's app
-menu, also install the desktop entry and icon from a checkout of this repo:
+Then install the binary via Cargo:
+
+```sh
+cargo install --locked --git [https://github.com/jonesy827/pippin](https://github.com/jonesy827/pippin)
+```
+
+*Optional:* `cargo install` only installs the binary. To launch `pippin` from your desktop application menu, install the `.desktop` entry and icon from a local checkout of this repository:
 
 ```sh
 install -Dm644 assets/pippin.desktop ~/.local/share/applications/pippin.desktop
 install -Dm644 assets/pippin.svg ~/.local/share/icons/hicolor/scalable/apps/pippin.svg
 ```
 
-To run it you'll need a GPU that wgpu supports (Vulkan or GL), and UDP
-ports 5900 and 5901 free. For sound, install
-libfdk-aac (`pacman -S libfdk-aac`, `apt install libfdk-aac2` or
-`dnf install fdk-aac`). Without it, pippin runs fine but silently.
+## Authentication
 
-## Passwords
-
-pippin checks these places for your password, in order:
-
-1. `--password` or the `PIPPIN_PASSWORD` environment variable
-2. stdin, if you pass `--password-stdin`
-3. your desktop keyring
-4. a prompt
+`pippin` checks for your password in the following order:
+1. `--password <PASS>` or the `PIPPIN_PASSWORD` environment variable
+2. Standard input via `--password-stdin`
+3. Your desktop keyring
+4. An interactive prompt (or a GUI dialog if launched without a terminal, or with `--dialog`)
 
 ```sh
-pass show mac | ./target/release/pippin my-mac.local -u alice --password-stdin
+# Example using pass
+pass show mac | pippin my-mac.local -u alice --password-stdin
 ```
 
-If you typed the password at a prompt, pippin asks whether to save it to
-the keyring (or saves it straight away with `--save-password`). It won't
-ask if no keyring is running. `--forget-password` removes a saved password.
-
-When there's no terminal, for example when launched from a `.desktop` file,
-pippin shows a small connect dialog instead of prompting. `--dialog`
-shows it even from a terminal.
+When prompted interactively, `pippin` offers to save your password to the desktop keyring. You can also pass `--save-password` to save it automatically, or `--forget-password` to remove an existing entry.
 
 ## Options
 
-| Option | |
+| Flag | Description |
 |---|---|
-| `--session share\|alt` | Share the logged-in user's screen (default), or log in to a separate session |
-| `--scale N` | Display scale. Defaults to 2× on HiDPI screens and 1× otherwise |
-| `--no-auto-resize` | Keep the Mac's display at a fixed size instead of following the window |
-| `--render-scale 0.5` | On a 2× window, stream a quarter of the pixels: slightly softer text for much less bandwidth |
-| `--decoder auto\|cuda\|vaapi\|software` | Choose the video decoder. `--vaapi-device` picks the render node |
-| `--after-loss idr\|conceal` | After packet loss, freeze until the next keyframe (default), or keep going with a smeared picture |
-| `--no-audio` | Don't play the Mac's sound, and ask the Mac not to send it |
-| `--swap-ctrl-cmd` | Use Ctrl as ⌘. By default Super is ⌘ and Alt is ⌥ |
-| `-v`, `-vv` | Debug or trace logging. Passwords and clipboard contents are never logged |
+| `--session share\|alt` | Share the active user's screen (default), or log into a separate background session. |
+| `--scale N` | Set display scale. Defaults to `2` on HiDPI screens, `1` otherwise. |
+| `--no-auto-resize` | Keep the Mac's display resolution fixed instead of resizing with the window. |
+| `--render-scale 0.5` | Stream at half resolution on a 2× display. Softens text slightly in exchange for a 75% bandwidth reduction. |
+| `--decoder <TYPE>` | Choose video decoder: `auto` (default), `cuda`, `vaapi`, or `software`. Use `--vaapi-device` to specify a render node. |
+| `--after-loss idr\|conceal` | On packet loss, freeze until the next keyframe (`idr`, default) or continue with visual artifacts (`conceal`). |
+| `--no-audio` | Mute audio and instruct the Mac not to stream sound. |
+| `--swap-ctrl-cmd` | Map `Ctrl` to `⌘`. By default, `Super` is `⌘` and `Alt` is `⌥`. |
+| `-v`, `-vv` | Enable debug or trace logging (passwords and clipboard contents are never logged). |
 
-## Hardware decoding
+## Performance & Troubleshooting
 
-The Mac only sends HEVC 4:4:4, which not every GPU can decode. NVIDIA
-Turing or newer (through CUDA) and Intel Ice Lake or newer (through VAAPI)
-can. AMD GPUs can't, so pippin falls back to software decoding there; it
-works fine but uses more CPU. To check your VAAPI driver, look for
-`VAProfileHEVCMain444` in the output of `vainfo`.
+### Hardware Decoding
+macOS streams exclusively in HEVC 4:4:4, which requires specific hardware support:
+* **NVIDIA:** Supported on Turing (GTX 16-series / RTX 20-series) or newer via CUDA.
+* **Intel:** Supported on Ice Lake (10th Gen) or newer via VAAPI (verify by checking `vainfo` for `VAProfileHEVCMain444`).
+* **AMD:** Hardware decoding is not supported for HEVC 4:4:4. `pippin` automatically falls back to CPU decoding, which works well at the cost of higher CPU usage.
 
-By default pippin tries CUDA first, then VAAPI, then software, moving on
-to the next if one fails.
+By default, `pippin` tries `cuda` → `vaapi` → `software`.
 
-## Slow and lossy networks
+### Slow or Lossy Networks
+Apple's protocol does not retransmit dropped video packets—any lost packet stalls the video until a full keyframe arrives. Even 1% packet loss can freeze the display half the time. To smooth out unstable connections:
+* Pass `--render-scale 0.5` to shrink keyframe sizes and cut bandwidth usage.
+* Pass `--after-loss conceal` to keep the video moving through packet drops (the image will smear briefly until the next keyframe, rather than freezing).
 
-The Mac never resends lost video packets, so each lost packet means
-waiting for a whole new keyframe. At 1% packet loss the picture is frozen
-about half the time, and none of the protocol's settings made a difference
-in our testing.
-
-Two options do help:
-
-- `--render-scale 0.5` uses much less bandwidth and makes keyframes
-  smaller.
-- `--after-loss conceal` keeps the picture moving after a loss. It looks
-  smeared until the next keyframe arrives, but it isn't frozen.
-
-## 4K
-
-When you switch to 4K, the decoder can take a few seconds to catch up.
-In the meantime incoming video piles up in the kernel (we've measured
-around 670 KB). If your system still has the default UDP receive buffer
-limit, raise it so frames aren't dropped:
+### 4K Streaming
+Switching to 4K can briefly backlog incoming video in the kernel (~670 KB) while the decoder initializes. If you experience dropped frames at 4K, raise Linux's maximum UDP receive buffer:
 
 ```sh
 sudo sysctl -w net.core.rmem_max=8388608
@@ -129,44 +113,25 @@ sudo sysctl -w net.core.rmem_max=8388608
 
 ## Limitations
 
-- Copy and paste works for text and images, but not files.
-- Linux only, on Wayland or X11.
-- IPv4 only, and only one copy of pippin per machine, because the media
-  ports are fixed.
+* **Clipboard:** Supports text and images, but not file transfers.
+* **Single Instance / IPv4:** Media ports are fixed, limiting `pippin` to IPv4 and one active session per client machine.
 
 ## Development
+
+Run the test suite with:
 
 ```sh
 cargo test
 ```
 
-`src/interop_tests.rs` checks the wire format byte for byte against
-vectors from the reference implementation. The decoder tests are marked
-`--ignored` because they need sample HEVC streams in
-`PIPPIN_TEST_HEVC_DIR`. You can make these with ffmpeg's `testsrc2` and
-`libx265`; `src/video/decoder.rs` lists the files it expects.
+* **Wire Format Tests:** `src/interop_tests.rs` verifies the protocol byte-for-byte against reference test vectors.
+* **Decoder Tests:** Marked `--ignored` by default as they require sample HEVC streams in `PIPPIN_TEST_HEVC_DIR`. You can generate these using FFmpeg (`testsrc2` + `libx265`); see `src/video/decoder.rs` for expected filenames.
+* **Network Telemetry:** Pass `--stats-json FILE` to log per-second metrics (schema in `src/session/metrics.rs`).
+* **Live Control:** Set `PIPPIN_CONTROL_FIFO=/tmp/pippin.ctl` to adjust parameters on the fly (e.g., `echo 'render_scale 0.5' > /tmp/pippin.ctl`). Supported commands (`render_scale`, `after_loss`, `hold`, `recovery`, `ltr`, `fps`, `keyframe`, `restart`) are documented in `src/session/operating.rs`.
+* **AUR Packaging:** AUR package definitions live in `packaging/aur/`. After tagging a release, bump `pkgver` in `packaging/aur/pippin/PKGBUILD`, then run `updpkgsums` and `makepkg --printsrcinfo > .SRCINFO` before pushing to the AUR.
 
-For network experiments:
+## Credits & License
 
-- `--stats-json FILE` writes a line of stats every second. The fields are
-  described in `src/session/metrics.rs`.
-- Set `PIPPIN_CONTROL_FIFO=/tmp/pippin.ctl` to change settings while
-  a session is running, e.g. `echo 'render_scale 0.5' > /tmp/pippin.ctl`.
-  The commands are `render_scale`, `after_loss`, `hold`, `recovery`, `ltr`,
-  `fps`, `keyframe` and `restart`, and they're documented in
-  `src/session/operating.rs`.
+`pippin` is an independent Rust implementation built on the protocol reverse-engineering work of [iShareScreen](https://github.com/renegadelink/iShareScreen). 
 
-The AUR packages live in `packaging/aur/`. After tagging a release, bump
-`pkgver` in `packaging/aur/pippin/PKGBUILD`, then run `updpkgsums` and
-`makepkg --printsrcinfo > .SRCINFO` before pushing it to the AUR.
-
-## Credits
-
-pippin stands on the shoulders of
-[iShareScreen](https://github.com/renegadelink/iShareScreen), which 
-reverse-engineered Apple's high-performance Screen Sharing protocol. 
-pippin is a separate implementation written in Rust.
-
-## License
-
-AGPL-3.0-or-later, the same as iShareScreen. See [LICENSE](LICENSE).
+Licensed under the **AGPL-3.0-or-later**. See [LICENSE](LICENSE) for details.
