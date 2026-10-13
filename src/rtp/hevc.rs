@@ -8,7 +8,7 @@ pub const NAL_VPS: u8 = 32;
 pub const NAL_SPS: u8 = 33;
 pub const NAL_PPS: u8 = 34;
 const NAL_AP: u8 = 48;
-const NAL_FU: u8 = 49;
+pub const NAL_FU: u8 = 49;
 
 pub fn nal_type(nal: &[u8]) -> u8 {
     (nal[0] >> 1) & 0x3f

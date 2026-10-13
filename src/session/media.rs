@@ -152,19 +152,20 @@ impl LossStats {
         }
         let holds = asm.take_stats();
         let damaged = shared.recovered_damaged.swap(0, Ordering::Relaxed);
-        if self.nacked > 0 || holds.started > 0 {
+        if self.nacked > 0 || holds.started > 0 || holds.donl_backwards > 0 {
             let rtt = match *shared.rtt.lock() {
                 Some(r) => format!("{:.1} ms", r.as_secs_f64() * 1000.0),
                 None => "unknown".into(),
             };
             tracing::debug!(
                 "loss: {} NACKed, {} retried; holds {} started, {} filled ({damaged} pictures damaged after), \
-                 {} given up; rtt {rtt}, hold {} ms",
+                 {} given up; DONL backwards {}; rtt {rtt}, hold {} ms",
                 self.nacked,
                 self.retried,
                 holds.started,
                 holds.filled,
                 holds.given_up,
+                holds.donl_backwards,
                 asm.wait().as_millis(),
             );
         }

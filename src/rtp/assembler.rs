@@ -26,9 +26,12 @@ const FLUSHED_TTL: Duration = Duration::from_secs(2);
 const DEFAULT_RTT: Duration = Duration::from_millis(25);
 /// Host turnaround for a retransmission, plus jitter and reordering.
 const TURNAROUND: Duration = Duration::from_millis(10);
-/// Bounds on the hold, whatever the round-trip estimate says.
-const MIN_WAIT: Duration = Duration::from_millis(20);
+/// Upper bound on the hold, whatever the round-trip estimate says. (The
+/// floor is two turnarounds plus a poll, 25 ms.)
 const MAX_WAIT: Duration = Duration::from_millis(300);
+/// A group without its marker, with later traffic in its decode order, that
+/// has had no packet for this long lost its tail rather than still arriving.
+const QUIET: Duration = Duration::from_millis(10);
 /// This many packets in a row behind an SSRC's last marker means its
 /// sequence numbers restarted rather than stragglers arriving.
 const STALE_RESET: u32 = 256;
@@ -55,6 +58,9 @@ pub struct HoldStats {
     pub started: u32,
     pub filled: u32,
     pub given_up: u32,
+    /// Complete linked access units whose DONL was behind the previous one
+    /// emitted: nonzero means DONL is not one counter across the tiles.
+    pub donl_backwards: u32,
 }
 
 struct Group {
@@ -119,6 +125,23 @@ fn before(sa: u32, a: &Group, sb: u32, b: &Group) -> bool {
     }
 }
 
+/// Whether contiguous payloads that may lack whatever came before them make
+/// a decodable IRAP access unit: the first packet starts a NAL, and the
+/// first slice is an IRAP slice that begins its picture. Parameter sets
+/// before it are kept if present; if they were lost the decoder uses the
+/// ones it has, which mid-stream on one SSRC are current (a parameter
+/// change comes with a new SSRC group, where nothing precedes the IRAP).
+fn whole_irap(payloads: &[(u16, &[u8])]) -> bool {
+    let Some((_, p)) = payloads.first() else { return false };
+    if p.len() >= 3 && hevc::nal_type(p) == hevc::NAL_FU && p[2] & 0x80 == 0 {
+        return false;
+    }
+    hevc::depayload(payloads)
+        .iter()
+        .find(|n| hevc::is_slice(n))
+        .is_some_and(|n| hevc::is_irap(n) && n.len() > 2 && n[2] & 0x80 != 0)
+}
+
 /// What to do with the first pending group in decode order.
 enum Verdict {
     /// Not ready; `holding` if that is for missing packets rather than the
@@ -144,6 +167,8 @@ pub struct Assembler {
     linked: HashSet<u32>,
     rtt: Duration,
     stats: HoldStats,
+    /// DONL of the last complete linked access unit emitted.
+    last_linked_donl: Option<u16>,
 }
 
 impl Default for Assembler {
@@ -156,6 +181,7 @@ impl Default for Assembler {
             linked: HashSet::new(),
             rtt: DEFAULT_RTT,
             stats: HoldStats::default(),
+            last_linked_donl: None,
         }
     }
 }
@@ -164,6 +190,7 @@ impl Assembler {
     /// Orders these SSRCs' access units together (the adopted tiles).
     pub fn link(&mut self, ssrcs: &[u32]) {
         self.linked = ssrcs.iter().copied().collect();
+        self.last_linked_donl = None;
     }
 
     pub fn set_rtt(&mut self, rtt: Duration) {
@@ -179,7 +206,7 @@ impl Assembler {
     /// How long an access unit with missing packets is held after its
     /// marker: room for the NACK, one retry and its answer, plus a poll.
     pub fn wait(&self) -> Duration {
-        (self.retry_after() * 2 + POLL_EVERY).clamp(MIN_WAIT, MAX_WAIT)
+        (self.retry_after() * 2 + POLL_EVERY).min(MAX_WAIT)
     }
 
     /// Something is in progress, so [`evict`](Self::evict) has work to do.
@@ -268,11 +295,15 @@ impl Assembler {
                 Some(t) => t.max(g.last_at) + self.wait(),
                 None => g.last_at + GROUP_TTL,
             };
-            return if now >= deadline {
-                Verdict::Emit { complete: false }
-            } else {
-                Verdict::Wait { holding: later.is_some() }
-            };
+            if now >= deadline {
+                return Verdict::Emit { complete: false };
+            }
+            // Only a detected gap, or a group gone quiet while later ones
+            // arrive, is a hold; otherwise it is still arriving.
+            let gap = g.packets.len() != g.last.wrapping_sub(g.first) as usize + 1
+                || self.last_marker.get(&key.0).is_some_and(|&m| g.first != m.wrapping_add(1));
+            let holding = later.is_some() && (gap || now >= g.last_at + QUIET);
+            return Verdict::Wait { holding };
         };
         if g.last != mseq {
             // A packet after the marker in the same group: no retransmission
@@ -282,8 +313,9 @@ impl Assembler {
         let contiguous = g.packets.len() == mseq.wrapping_sub(g.first) as usize + 1;
         let starts_after_prev = self.last_marker.get(&key.0).is_none_or(|&m| g.first == m.wrapping_add(1));
         // An IRAP resets the shared DPB, so whatever came before it no
-        // longer matters.
-        if contiguous && (starts_after_prev || hevc::depayload(&g.payloads()).iter().any(|n| hevc::is_irap(n))) {
+        // longer matters, as long as the access unit itself is whole from
+        // its first slice.
+        if contiguous && (starts_after_prev || whole_irap(&g.payloads())) {
             Verdict::Emit { complete: true }
         } else if now >= marker_at + self.wait() {
             Verdict::Emit { complete: false }
@@ -336,10 +368,20 @@ impl Assembler {
         if !complete {
             nalus.retain(|n| hevc::is_param_set(n));
         }
+        let donl = hevc::first_donl(&refs);
+        if complete
+            && self.linked.contains(&key.0)
+            && let Some(d) = donl
+        {
+            if self.last_linked_donl.is_some_and(|p| d.wrapping_sub(p) >= 0x8000) {
+                self.stats.donl_backwards += 1;
+            }
+            self.last_linked_donl = Some(d);
+        }
         AccessUnit {
             ssrc: key.0,
             nalus,
-            donl: hevc::first_donl(&refs),
+            donl,
             complete,
             recovered: complete && g.held,
             received: g.started,
@@ -468,9 +510,9 @@ mod tests {
         vec![hevc::NAL_VPS << 1, 1, 0, 1, 0xaa]
     }
 
-    /// A fragment of an IDR slice.
-    fn idr_fu(flags: u8) -> Vec<u8> {
-        vec![49 << 1, 1, flags | 19, 0, 1, 0xcc]
+    /// A fragment of an IDR slice; `first` sets first_slice_segment_in_pic.
+    fn idr_fu(flags: u8, first: bool) -> Vec<u8> {
+        vec![49 << 1, 1, flags | 19, 0, 1, if first { 0x80 } else { 0x40 }, 0xcc]
     }
 
     fn one(mut aus: Vec<AccessUnit>) -> AccessUnit {
@@ -626,7 +668,7 @@ mod tests {
             // Seq 12, this AU's tail and marker, is lost.
             assert!(a.push(pkt(9, 10, 1, false, single(1)), t0).is_empty());
             assert!(a.push(pkt(9, 11, 1, false, single(1)), t0).is_empty());
-            let (p1, p2) = if irap { (idr_fu(0x80), idr_fu(0x40)) } else { (single(1), single(1)) };
+            let (p1, p2) = if irap { (idr_fu(0x80, true), idr_fu(0x40, true)) } else { (single(1), single(1)) };
             assert!(a.push(pkt(9, 13, 2, false, p1), t0).is_empty());
             assert!(a.push(pkt(9, 14, 2, true, p2), t0).is_empty());
             let aus = a.evict(t0 + a.wait());
@@ -672,18 +714,92 @@ mod tests {
     }
 
     #[test]
+    fn irap_missing_its_leading_slice_is_not_complete() {
+        let t0 = Instant::now();
+        let mut a = Assembler::default();
+        assert!(one(a.push(pkt(9, 9, 0, true, single(1)), t0)).complete);
+        // The IDR's first slice (seq 10-11) is lost; its second slice,
+        // seq 12-13, arrives whole.
+        assert!(a.push(pkt(9, 12, 1, false, idr_fu(0x80, false)), t0).is_empty());
+        assert!(a.push(pkt(9, 13, 1, true, idr_fu(0x40, false)), t0).is_empty());
+        assert_eq!(order(&a.evict(t0 + a.wait())), vec![(9, false)]);
+
+        // Same with only the tail of the first slice's fragments.
+        let mut a = Assembler::default();
+        assert!(one(a.push(pkt(9, 9, 0, true, single(1)), t0)).complete);
+        assert!(a.push(pkt(9, 11, 1, false, idr_fu(0, true)), t0).is_empty());
+        assert!(a.push(pkt(9, 12, 1, true, idr_fu(0x40, true)), t0).is_empty());
+        assert_eq!(order(&a.evict(t0 + a.wait())), vec![(9, false)]);
+
+        // Parameter sets lost but the first slice whole: complete at once.
+        let mut a = Assembler::default();
+        assert!(one(a.push(pkt(9, 9, 0, true, single(1)), t0)).complete);
+        assert!(a.push(pkt(9, 11, 1, false, idr_fu(0x80, true)), t0).is_empty());
+        assert!(one(a.push(pkt(9, 12, 1, true, idr_fu(0x40, true)), t0)).complete);
+    }
+
+    #[test]
+    fn arriving_access_unit_is_not_a_hold() {
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        let mut a = Assembler::default();
+        a.link(&[10, 11]);
+        // Tile 10's AU is still arriving when tile 11's starts.
+        assert!(a.push(pkt(10, 1, 1, false, slice(100)), t0).is_empty());
+        assert!(a.push(pkt(11, 1, 1, false, slice(101)), t0).is_empty());
+        assert!(a.push(pkt(10, 2, 1, false, slice(100)), ms(2)).is_empty());
+        assert!(a.evict(ms(3)).is_empty());
+        let au = one(a.push(pkt(10, 3, 1, true, slice(100)), ms(4)));
+        assert!(au.complete && !au.recovered);
+        let au = one(a.push(pkt(11, 2, 1, true, slice(101)), ms(4)));
+        assert!(au.complete && !au.recovered);
+        assert_eq!(a.take_stats().started, 0);
+
+        // Gone quiet with later traffic: its marker was lost, so it is held.
+        assert!(a.push(pkt(10, 4, 2, false, slice(102)), ms(10)).is_empty());
+        assert!(a.push(pkt(11, 3, 2, true, slice(103)), ms(10)).is_empty());
+        assert!(a.evict(ms(15)).is_empty());
+        assert_eq!(a.take_stats().started, 0);
+        assert!(a.evict(ms(20)).is_empty());
+        assert_eq!(a.take_stats().started, 1);
+        let aus = a.push(pkt(10, 5, 2, true, slice(102)), ms(25));
+        assert_eq!(order(&aus), vec![(10, true), (11, true)]);
+        assert!(aus[0].recovered && !aus[1].recovered);
+    }
+
+    #[test]
+    fn counts_donl_going_backwards() {
+        let t0 = Instant::now();
+        let mut a = Assembler::default();
+        a.link(&[10, 11]);
+        assert!(one(a.push(pkt(10, 1, 1, true, slice(500)), t0)).complete);
+        assert!(one(a.push(pkt(11, 1, 1, true, slice(501)), t0)).complete);
+        assert_eq!(a.take_stats().donl_backwards, 0);
+        // A counter per tile would show up as one tile's DONL far behind.
+        assert!(one(a.push(pkt(11, 2, 2, true, slice(100)), t0)).complete);
+        assert_eq!(a.take_stats().donl_backwards, 1);
+        // Unlinked streams don't count.
+        assert!(one(a.push(pkt(99, 1, 1, true, slice(1)), t0)).complete);
+        assert_eq!(a.take_stats().donl_backwards, 0);
+    }
+
+    #[test]
     fn wait_follows_rtt() {
         let mut a = Assembler::default();
         assert_eq!(a.retry_after(), Duration::from_millis(35));
         assert_eq!(a.wait(), Duration::from_millis(75));
-        // LAN: the retry's answer still lands before the give-up.
-        let rtt = Duration::from_millis(1);
-        a.set_rtt(rtt);
+        // LAN: retry at 11 ms, answered by ~12 ms; given up at 27 ms.
+        a.set_rtt(Duration::from_millis(1));
         assert_eq!(a.retry_after(), Duration::from_millis(11));
         assert_eq!(a.wait(), Duration::from_millis(27));
-        assert!(a.retry_after() + rtt + TURNAROUND + POLL_EVERY <= a.wait());
-        a.set_rtt(Duration::from_secs(1));
-        assert_eq!(a.wait(), MAX_WAIT);
+        a.set_rtt(Duration::ZERO);
+        assert_eq!(a.retry_after(), Duration::from_millis(10));
+        assert_eq!(a.wait(), Duration::from_millis(25));
+        a.set_rtt(Duration::from_millis(100));
+        assert_eq!(a.retry_after(), Duration::from_millis(110));
+        assert_eq!(a.wait(), Duration::from_millis(225));
+        a.set_rtt(Duration::from_millis(200));
+        assert_eq!(a.wait(), Duration::from_millis(300));
     }
 
     #[test]
