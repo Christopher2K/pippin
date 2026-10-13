@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 
 use super::{AfterLoss, Event, Shared};
+use crate::audio::Player;
 use crate::proto::offers::{MediaOffer, SRTP_BLOB_LEN};
 use crate::rtp::assembler::{AccessUnit, Assembler, HoldStats, POLL_EVERY, TileMap};
 use crate::rtp::srtp::{SrtcpReceiver, SrtcpSender, SrtpReceiver, SrtpSender};
@@ -446,25 +447,94 @@ pub(super) fn video_rx(
     }
 }
 
-/// Drains the control/audio UDP port. Audio is not played; only RTCP is
-/// kept, for round-trip estimates (ours and the host's via our receiver
-/// reports).
-pub(super) fn ctrl_rx(shared: Arc<Shared>, sock: UdpSocket, key: [u8; SRTP_BLOB_LEN]) {
+/// Drains the control/audio UDP port, which carries the host's audio RTP
+/// and RTCP muxed together. Audio goes to the player; RTCP is kept for
+/// round-trip estimates (ours and the host's via our receiver reports).
+pub(super) fn ctrl_rx(
+    shared: Arc<Shared>,
+    sock: UdpSocket,
+    key: [u8; SRTP_BLOB_LEN],
+    audio: Option<(Player, [u8; SRTP_BLOB_LEN])>,
+) {
     let srtcp = SrtcpReceiver::new(&key);
+    let mut audio = audio.and_then(|(player, key)| match AudioRx::new(player, &key) {
+        Ok(rx) => Some(rx),
+        Err(e) => {
+            tracing::warn!("no sound: {e:#}");
+            None
+        }
+    });
     let mut buf = vec![0u8; 65536];
     while !shared.stopped() {
         match sock.recv_from(&mut buf) {
             Ok((n, _)) => {
                 let pkt = &buf[..n];
-                if is_rtcp(pkt)
-                    && let Some(data) = srtcp.unprotect(pkt) {
+                if is_rtcp(pkt) {
+                    if let Some(data) = srtcp.unprotect(pkt) {
                         record_sender_reports(&shared, &data);
                     }
+                } else if let Some(a) = audio.as_mut() {
+                    a.packet(pkt);
+                }
             }
             Err(e) if is_timeout(&e) => {}
             Err(e) => {
                 tracing::debug!("ctrl socket: {e}");
                 std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+    if let Some(a) = audio {
+        a.player.flush();
+    }
+}
+
+/// Lost audio packets up to this many in a row are concealed by the
+/// decoder; longer gaps just go quiet.
+const MAX_CONCEAL: u16 = 3;
+
+/// Decrypts and decodes the host's audio stream.
+struct AudioRx {
+    srtp: SrtpReceiver,
+    decoder: crate::audio::aac::Decoder,
+    player: Player,
+    last_seq: Option<u16>,
+    failures: u64,
+}
+
+impl AudioRx {
+    fn new(player: Player, key: &[u8; SRTP_BLOB_LEN]) -> anyhow::Result<Self> {
+        let decoder = crate::audio::aac::Decoder::new()?;
+        Ok(Self { srtp: SrtpReceiver::new(key), decoder, player, last_seq: None, failures: 0 })
+    }
+
+    fn packet(&mut self, pkt: &[u8]) {
+        let Some(rtp) = self.srtp.unprotect(pkt) else { return };
+        if rtp.pt != AUDIO_PT {
+            return;
+        }
+        if let Some(last) = self.last_seq {
+            let gap = rtp.seq.wrapping_sub(last);
+            if gap == 0 || gap > 0x8000 {
+                // Duplicate or late: already played past it.
+                return;
+            }
+            for _ in 1..gap.min(MAX_CONCEAL + 1) {
+                if let Ok(pcm) = self.decoder.conceal() {
+                    self.player.push(pcm);
+                }
+            }
+        }
+        self.last_seq = Some(rtp.seq);
+        match self.decoder.decode(&rtp.payload) {
+            Ok(pcm) => self.player.push(pcm),
+            Err(e) => {
+                self.failures += 1;
+                if self.failures == 1 {
+                    tracing::warn!("audio decode failed: {e:#}");
+                } else {
+                    tracing::trace!("audio decode failed: {e:#}");
+                }
             }
         }
     }

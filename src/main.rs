@@ -5,6 +5,7 @@
 //! macshare: a native client for macOS Screen Sharing's high-performance
 //! (HEVC) mode.
 
+mod audio;
 mod clipboard;
 mod credentials;
 mod errors;
@@ -113,6 +114,9 @@ struct Cli {
     /// windows move, but holds early tiles until the last one is decoded.
     #[arg(long)]
     sync_tiles: bool,
+    /// Don't play the Mac's sound (and ask it not to send any).
+    #[arg(long)]
+    no_audio: bool,
     /// Skip the preliminary connection that wakes the host's daemon.
     #[arg(long)]
     no_warmup: bool,
@@ -340,6 +344,13 @@ fn connect(
             credentials::after_auth(store.as_ref(), &account, &password, source, ok, save, || false);
         })
     };
+    let audio = if cli.no_audio {
+        None
+    } else {
+        audio::Player::new()
+            .inspect_err(|e| tracing::warn!("no sound: {e:#}"))
+            .ok()
+    };
     let cfg = session::Config {
         host,
         port: cli.port,
@@ -368,6 +379,7 @@ fn connect(
         // Debug only: switch operating-point levers mid-session by writing
         // lines such as `fps 30` or `hold off` to this FIFO.
         control_fifo: std::env::var_os("MACSHARE_CONTROL_FIFO").map(PathBuf::from),
+        audio: audio.clone(),
     };
     let opts = ui::Options {
         title: format!("{host_name} — macshare"),

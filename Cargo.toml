@@ -39,6 +39,8 @@ uuid = { version = "1.28.0", features = ["v4"] }
 wl-clipboard-rs = "0.9.4"
 wgpu = "30.0.1"
 winit = "0.30"
+cpal = "0.15.3"
+libloading = "0.8.9"
 keyring = { version = "3", features = ["async-secret-service", "async-io", "crypto-rust"] }
 egui = "0.36"
 egui-wgpu = { version = "0.36", default-features = false }

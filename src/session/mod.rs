@@ -7,7 +7,8 @@
 //! * `video-rx` receives SRTP video, assembles access units, maps SSRCs to
 //!   tiles and hands work to `decoder`.
 //! * `decoder` runs libavcodec and publishes pictures to the [`FrameStore`].
-//! * `ctrl-rx` drains the audio/RTCP UDP port and records sender reports.
+//! * `ctrl-rx` drains the audio/RTCP UDP port: decodes the Mac's sound for
+//!   the [`audio::Player`](crate::audio::Player) and records sender reports.
 //! * `feedback` sends RTCP (receiver reports, keyframe requests, NACKs, LTR
 //!   acks), the audio keepalive and the cursor poll on a 500 ms tick.
 //! * `clipboard` mirrors text between the local and remote pasteboards.
@@ -86,6 +87,8 @@ pub struct Config {
     pub stats_json: Option<PathBuf>,
     /// Debug FIFO to read operating-point commands from.
     pub control_fifo: Option<PathBuf>,
+    /// Plays the Mac's sound; `None` asks the host not to send any.
+    pub audio: Option<crate::audio::Player>,
 }
 
 pub type AuthHook = Arc<dyn Fn(bool) + Send + Sync>;
@@ -505,7 +508,7 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
         password: cfg.password.clone(),
         session_mode: cfg.session_mode,
         display,
-        audio: false,
+        audio: cfg.audio.is_some(),
         offer: shared.op().offer_options(),
         on_open: Some(Box::new({
             let shared = shared.clone();
@@ -593,7 +596,8 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
     {
         let (shared, sock) = (shared.clone(), ctrl_sock.try_clone()?);
         let key = neg.offer.video_key_s;
-        spawn(threads, "ctrl-rx", move || media::ctrl_rx(shared, sock, key));
+        let audio = cfg.audio.clone().map(|p| (p, neg.offer.audio_key_s));
+        spawn(threads, "ctrl-rx", move || media::ctrl_rx(shared, sock, key, audio));
     }
     {
         let shared = shared.clone();

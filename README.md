@@ -6,9 +6,9 @@ two Macs; macshare brings it to Linux.
 
 There's nothing to install on the Mac. Turn on Screen Sharing and connect,
 and you get sharp HEVC 4:4:4 video with the Mac's display resized to fit
-your window. Text and images copy and paste in both directions, the cursor
-is drawn locally so it never lags behind your mouse, and video is decoded
-on the GPU whenever possible.
+your window, plus the Mac's sound. Text and images copy and paste in both
+directions, the cursor is drawn locally so it never lags behind your
+mouse, and video is decoded on the GPU whenever possible.
 
 ## Quick start
 
@@ -21,9 +21,12 @@ cargo build --release
 ./target/release/macshare my-mac.local -u alice
 ```
 
-To build you'll need `clang` and the FFmpeg development libraries
-(`libavcodec`, `libavutil`). To run it you'll need a GPU that wgpu supports
-(Vulkan or GL), and UDP ports 5900 and 5901 free.
+To build you'll need `clang`, the FFmpeg development libraries
+(`libavcodec`, `libavutil`) and ALSA (`libasound2-dev` on Debian/Ubuntu).
+To run it you'll need a GPU that wgpu supports (Vulkan or GL), and UDP
+ports 5900 and 5901 free. For sound, install
+libfdk-aac (`pacman -S libfdk-aac`, `apt install libfdk-aac2` or
+`dnf install fdk-aac`). Without it, macshare runs fine but silently.
 
 ## Passwords
 
@@ -56,6 +59,7 @@ shows it even from a terminal.
 | `--render-scale 0.5` | On a 2× window, stream a quarter of the pixels: slightly softer text for much less bandwidth |
 | `--decoder auto\|cuda\|vaapi\|software` | Choose the video decoder. `--vaapi-device` picks the render node |
 | `--after-loss idr\|conceal` | After packet loss, freeze until the next keyframe (default), or keep going with a smeared picture |
+| `--no-audio` | Don't play the Mac's sound, and ask the Mac not to send it |
 | `--swap-ctrl-cmd` | Use Ctrl as ⌘. By default Super is ⌘ and Alt is ⌥ |
 | `-v`, `-vv` | Debug or trace logging. Passwords and clipboard contents are never logged |
 
@@ -97,7 +101,6 @@ sudo sysctl -w net.core.rmem_max=8388608
 
 ## Limitations
 
-- No audio.
 - Copy and paste works for text and images, but not files.
 - Linux only, on Wayland or X11.
 - IPv4 only, and only one copy of macshare per machine, because the media
