@@ -14,31 +14,39 @@ mouse, and video is decoded on the GPU whenever possible.
 
 High-performance mode needs an Apple silicon Mac running macOS Sonoma or
 later. On the Mac, turn on System Settings → General → Sharing → Screen
-Sharing. Then, on Linux:
+Sharing. Then install pippin on Linux and run:
 
 ```sh
-cargo build --release
-./target/release/pippin my-mac.local -u alice
+pippin my-mac.local -u alice
 ```
 
-Building needs Rust 1.95 or newer (distro packages are often older; use
-[rustup](https://rustup.rs)), plus clang, pkg-config, FFmpeg's development
-headers and ALSA:
+## Installing
+
+On Arch, install [`pippin`](https://aur.archlinux.org/packages/pippin)
+(latest release) or [`pippin-git`](https://aur.archlinux.org/packages/pippin-git)
+(latest commit) from the AUR:
+
+```sh
+yay -S pippin
+```
+
+Everywhere else, install with cargo. You'll need Rust 1.95 or newer
+(distro packages are often older; use [rustup](https://rustup.rs)), plus
+clang, pkg-config, FFmpeg's development headers and ALSA:
 
 ```sh
 # Debian 13 / Ubuntu 24.04
 sudo apt install build-essential pkg-config clang libclang-dev libavcodec-dev libavutil-dev libasound2-dev
 # Fedora
 sudo dnf install gcc pkgconf-pkg-config clang clang-devel libavcodec-free-devel libavutil-free-devel alsa-lib-devel
-# Arch
-sudo pacman -S base-devel clang ffmpeg alsa-lib pkgconf
+
+cargo install --locked --git https://github.com/jonesy827/pippin
 ```
 
-To launch it from your desktop's app menu, install the binary, desktop
-entry and icon:
+cargo installs only the binary. To launch pippin from your desktop's app
+menu, also install the desktop entry and icon from a checkout of this repo:
 
 ```sh
-install -Dm755 target/release/pippin ~/.local/bin/pippin
 install -Dm644 assets/pippin.desktop ~/.local/share/applications/pippin.desktop
 install -Dm644 assets/pippin.svg ~/.local/share/icons/hicolor/scalable/apps/pippin.svg
 ```
@@ -147,6 +155,10 @@ For network experiments:
   The commands are `render_scale`, `after_loss`, `hold`, `recovery`, `ltr`,
   `fps`, `keyframe` and `restart`, and they're documented in
   `src/session/operating.rs`.
+
+The AUR packages live in `packaging/aur/`. After tagging a release, bump
+`pkgver` in `packaging/aur/pippin/PKGBUILD`, then run `updpkgsums` and
+`makepkg --printsrcinfo > .SRCINFO` before pushing it to the AUR.
 
 ## Credits
 

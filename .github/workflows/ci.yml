@@ -18,7 +18,7 @@ jobs:
         # 1.95 is the rust-version in Cargo.toml (egui's minimum).
         toolchain: [stable, "1.95"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install system libraries
         run: |
           sudo apt-get update
