@@ -145,7 +145,19 @@ impl Backend {
     pub fn is_hw(self) -> bool {
         self != Backend::Software
     }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Backend::Cuda => "cuda",
+            Backend::Vaapi => "vaapi",
+            Backend::Software => "software",
+        }
+    }
 }
+
+/// GPU frame downloads that may fail in a row while concealing before the
+/// backend counts as broken.
+const LENIENT_TRANSFER_FAILURES: u32 = 8;
 
 /// Hardware backends that failed on the host's stream, as `1 << Backend`.
 /// Kept for the process so reconnects skip them instead of wasting a
@@ -168,6 +180,10 @@ pub struct Decoder {
     hw_fmt: Option<PixFmt::Type>,
     warned_format: bool,
     broken: bool,
+    /// See [`Decoder::set_lenient`].
+    lenient: bool,
+    /// GPU frame downloads failed in a row.
+    transfer_failures: u32,
 }
 
 // The decoder is used from a single thread at a time; the raw pointers are
@@ -252,6 +268,13 @@ impl Decoder {
         self.broken
     }
 
+    /// While set, a failed GPU frame download drops the picture instead of
+    /// marking the backend broken, up to LENIENT_TRANSFER_FAILURES in a
+    /// row: set while decoding concealed pictures.
+    pub fn set_lenient(&mut self, lenient: bool) {
+        self.lenient = lenient;
+    }
+
     fn open(backend: Backend, opts: &DecoderOptions) -> Result<Self> {
         unsafe {
             let codec = ffi::avcodec_find_decoder(ffi::AVCodecID::AV_CODEC_ID_HEVC);
@@ -270,6 +293,8 @@ impl Decoder {
                 hw_fmt: None,
                 warned_format: false,
                 broken: false,
+                lenient: false,
+                transfer_failures: 0,
             };
             if dec.pkt.is_null() || dec.frame.is_null() {
                 bail!("allocating FFmpeg packet/frame failed");
@@ -380,12 +405,20 @@ impl Decoder {
                 let r = ffi::av_hwframe_transfer_data(sw, f, 0);
                 if r < 0 {
                     ffi::av_frame_free(&mut sw);
+                    self.transfer_failures += 1;
+                    if self.lenient && self.transfer_failures < LENIENT_TRANSFER_FAILURES {
+                        // Likely a concealed picture the driver choked on:
+                        // drop it rather than give up on the backend.
+                        tracing::debug!("GPU frame download failed while concealing: {}", av_err(r));
+                        return None;
+                    }
                     if !self.broken {
                         tracing::warn!("GPU frame download failed: {}", av_err(r));
                     }
                     self.broken = true;
                     return None;
                 }
+                self.transfer_failures = 0;
                 FrameRef(sw)
             } else {
                 if self.backend.is_hw() && !self.broken {

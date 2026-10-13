@@ -13,7 +13,9 @@
 //!   (fir, pli or fir+pli), `hold` (the mode: auto, on, off), `holding`
 //!   (whether access units with gaps are held right now; auto can switch
 //!   it off), `ltr` (LTR offered and acked), `after_loss` (idr: drop
-//!   pictures until the next keyframe; conceal: keep decoding).
+//!   pictures until the next keyframe; conceal: keep decoding), `decoder`
+//!   (the video decoder backend in use: vaapi, cuda or software; null
+//!   before the decoder opened).
 //! * What the host settled on: `canvas` (`[width, height]` of the encoded
 //!   canvas, from its answer or the latest display layout; null before
 //!   either), `answer_ltrp` (ltrpEnabled in the host's latest answer; null
@@ -29,8 +31,8 @@
 //!   number holes as first seen over packets expected: the loss before any
 //!   repair; a reordered packet counts as a hole too), `jitter_ms` (RFC
 //!   3550 interarrival jitter at the end) and `fps` (distinct RTP
-//!   timestamps per second: the pictures the host sent for that tile,
-//!   whether or not they arrived whole).
+//!   timestamps per second: the host's pictures for that tile of which at
+//!   least one packet arrived, whole or not).
 //! * `nacks`: packets NACKed for the first time; `nack_retries`: packets
 //!   NACKed a second time; `nacked_arrived`: NACKed packets that arrived
 //!   within 1 s of their first NACK (retransmissions, or late originals),
@@ -57,12 +59,17 @@
 //!   size of the first access unit on each of the other tiles after an
 //!   IRAP (the host's IDR covers the base tile only; the rest follow).
 //! * `recovery_n`, `recovery_p50_ms`, `recovery_max_ms`: outages caused by
-//!   loss and how long they lasted. An outage starts with the first loss
-//!   keyframe request (gap, decode, damaged) while none is open; requests
-//!   repeated during it add nothing. It ends with the first picture, of any
+//!   loss and how long they lasted. An outage starts at the first loss the
+//!   decoder sees (gap, decode, damaged) while none is open, whether or not
+//!   its keyframe request went out (it may be rate-limited); later losses
+//!   during it add nothing. A gap is seen when the hold gives up, so the
+//!   hold's wait comes before the outage: it shows in `frozen_ms`, not
+//!   here. It ends with the first picture, of any
 //!   tile, decoded from an IRAP fed after the loss or from what followed
 //!   it: a clean P picture that may still reference the damage doesn't end
-//!   it. Adopting a new SSRC group drops an open outage without a sample.
+//!   it. A stall reset of the decoder keeps it open. Adopting a new SSRC
+//!   group drops an open outage without a sample; `recovery_dropped`
+//!   counts those.
 //!   Samples belong to the interval the outage ended in. Null when none
 //!   ended in the interval.
 //! * `frozen_ms`: time in the interval, sampled every 10 ms, during which
@@ -139,6 +146,9 @@ pub(super) struct Metrics {
     pub presented: AtomicU64,
     pub awaiting_idr: AtomicBool,
     concealed_pictures: AtomicU64,
+    recovery_dropped: AtomicU64,
+    /// Backend name of the video decoder in use.
+    decoder: Mutex<&'static str>,
     /// The latest picture published was concealed.
     concealing: AtomicBool,
     /// ltrpEnabled in the latest answer: 0 unknown, 1 off, 2 on.
@@ -182,7 +192,13 @@ impl Metrics {
 
     /// The stream was replaced; an open outage won't be repaired.
     pub fn end_outage(&self) {
-        self.recovery.lock().open = None;
+        if self.recovery.lock().open.take().is_some() {
+            self.recovery_dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn set_decoder(&self, name: &'static str) {
+        *self.decoder.lock() = name;
     }
 
     /// A NACKed packet arrived, `after` its first NACK.
@@ -369,7 +385,7 @@ fn line(m: &Metrics, cx: &LineContext) -> String {
     let _ = write!(
         s,
         "{{\"t\":{},\"session_t\":{},\"dt\":{},\"op\":{{\"render_scale\":{},\"fps\":{},\"recovery\":\"{}\",\
-         \"hold\":\"{}\",\"holding\":{},\"ltr\":{},\"after_loss\":\"{}\"}}",
+         \"hold\":\"{}\",\"holding\":{},\"ltr\":{},\"after_loss\":\"{}\",\"decoder\":{}}}",
         num(cx.t, 3),
         num(cx.session_t, 3),
         num(cx.dt, 3),
@@ -380,6 +396,10 @@ fn line(m: &Metrics, cx: &LineContext) -> String {
         m.holding.load(Ordering::Relaxed),
         op.ltr,
         op.after_loss.name(),
+        match *m.decoder.lock() {
+            "" => "null".to_string(),
+            name => format!("\"{name}\""),
+        },
     );
     match cx.canvas {
         Some((w, h)) => {
@@ -449,6 +469,7 @@ fn line(m: &Metrics, cx: &LineContext) -> String {
         }
         (_, None) => s.push_str(",\"recovery_n\":0,\"recovery_p50_ms\":null,\"recovery_max_ms\":null"),
     }
+    let _ = write!(s, ",\"recovery_dropped\":{}", take(&m.recovery_dropped));
     let aus = take(&m.decoded_aus);
     let busy = Duration::from_nanos(take(&m.decode_ns));
     let worst = Duration::from_nanos(take(&m.decode_worst_ns));
@@ -606,8 +627,10 @@ mod tests {
         // An outage cut short by a new stream gives no sample.
         m.outage(6, ms(50));
         m.end_outage();
+        m.end_outage();
         m.picture(0, 7, 0, ms(90));
         assert_eq!(summary(&mut m.recovery.lock().samples), (0, None));
+        assert_eq!(m.recovery_dropped.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -688,6 +711,7 @@ mod tests {
         m.decoded(Duration::from_millis(3));
         m.shown(true);
         m.shown(false);
+        m.set_decoder("vaapi");
         let op = op();
         let tiles = [
             TileLine { loss_pct: 1.0, loss_pre_pct: 3.0, jitter_ms: 2.5, fps: 29.5 },
@@ -710,7 +734,7 @@ mod tests {
         assert_eq!(
             l,
             "{\"t\":1.500,\"session_t\":2.000,\"dt\":2.000,\"op\":{\"render_scale\":0.5,\"fps\":30,\
-             \"recovery\":\"pli\",\"hold\":\"off\",\"holding\":false,\"ltr\":false,\"after_loss\":\"conceal\"},\"canvas\":[2560,1440],\
+             \"recovery\":\"pli\",\"hold\":\"off\",\"holding\":false,\"ltr\":false,\"after_loss\":\"conceal\",\"decoder\":\"vaapi\"},\"canvas\":[2560,1440],\
              \"answer_ltrp\":false,\"max_tile_fps\":30.0,\"video_pps\":50.0,\"video_bytes_ps\":0.0,\
              \"tiles\":[{\"loss_pct\":1.00,\"loss_pre_pct\":3.00,\"jitter_ms\":2.50,\"fps\":29.5},\
              {\"loss_pct\":0.00,\"loss_pre_pct\":0.00,\"jitter_ms\":0.00,\"fps\":30.0}],\"nacks\":0,\
@@ -719,7 +743,7 @@ mod tests {
              \"kf_loss_fir_pli\":0,\"kf_gap\":1,\"kf_decode\":0,\"kf_damaged\":0,\"kf_adoption\":0,\
              \"kf_reoffer\":0,\"kf_stall\":0,\"kf_hw_fallback\":0,\"kf_other\":0,\"kf_suppressed\":0,\
              \"irap_aus\":0,\"irap_bytes\":0,\"irap_follow_bytes\":0,\"recovery_n\":0,\
-             \"recovery_p50_ms\":null,\"recovery_max_ms\":null,\"frozen_ms\":30,\"concealed_ms\":40,\"concealed_pictures\":1,\"decode_aus\":1,\
+             \"recovery_p50_ms\":null,\"recovery_max_ms\":null,\"recovery_dropped\":0,\"frozen_ms\":30,\"concealed_ms\":40,\"concealed_pictures\":1,\"decode_aus\":1,\
              \"decode_avg_ms\":3.0,\"decode_worst_ms\":3.0,\"presented_fps\":0.0,\"rtt_ms\":null}"
         );
         // Counters were consumed.

@@ -84,8 +84,16 @@ pub enum Feedback {
 
 pub(super) enum DecoderMsg {
     Au { tile: usize, au: AccessUnit },
-    /// The tile mapping changed; start over from the next IDR.
-    Reset,
+    /// Start over from the next IDR.
+    Reset(ResetWhy),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ResetWhy {
+    /// A new SSRC group was adopted: a new stream.
+    Adoption,
+    /// No pictures for a long time on the same stream.
+    Stall,
 }
 
 pub(super) struct FeedbackSockets {
@@ -308,6 +316,7 @@ pub(super) fn video_rx(
                         record_sender_reports(&shared, &data);
                     }
                 } else if let Some(p) = srtp.unprotect(pkt) {
+                    let now = Instant::now();
                     shared.touch(&shared.last_video_packet);
                     shared.metrics.video_packets.fetch_add(1, Ordering::Relaxed);
                     shared.metrics.video_bytes.fetch_add(n as u64, Ordering::Relaxed);
@@ -316,7 +325,6 @@ pub(super) fn video_rx(
                     }
                     tiles.count_packet(p.ssrc);
                     if let Some(tile) = tiles.tile_of(p.ssrc) {
-                        let now = Instant::now();
                         shared.metrics.tile_packet(tile, shared.clock.now_ms());
                         // A newer RTP timestamp is a new picture from the host.
                         let newer = last_ts.get(&p.ssrc).is_none_or(|&t| (1..0x8000_0000).contains(&p.ts.wrapping_sub(t)));
@@ -329,7 +337,11 @@ pub(super) fn video_rx(
                             // A retransmission, or a late original: either
                             // way a long enough hold would have been filled.
                             shared.metrics.nack_arrived(after);
-                            asm.nacked_arrived();
+                            // Only an arrival a hold could have waited for
+                            // argues for holding.
+                            if after <= asm.wait() {
+                                asm.nacked_arrived();
+                            }
                         }
                         // Gap detection for NACKs; the assembler deals with order.
                         let expected = *next_seq.entry(p.ssrc).or_insert(p.seq);
@@ -357,7 +369,7 @@ pub(super) fn video_rx(
                             }
                         }
                     }
-                    let aus = asm.push(p, Instant::now());
+                    let aus = asm.push(p, now);
                     if !route(&mut tiles, &dec, aus) {
                         return;
                     }
@@ -424,7 +436,7 @@ pub(super) fn video_rx(
                 shared.renegotiated.store(0, Ordering::Relaxed);
                 // Don't let the stall timer immediately allow another switch.
                 shared.touch(&shared.last_frame);
-                let _ = dec.send(DecoderMsg::Reset);
+                let _ = dec.send(DecoderMsg::Reset(ResetWhy::Adoption));
                 for (tile, au) in backlog {
                     let _ = dec.send(DecoderMsg::Au { tile, au });
                 }
@@ -667,6 +679,7 @@ impl DecodeLoop {
                 if d.backend() != self.decoder.backend() {
                     tracing::info!("video decoder: {:?}", d.backend());
                 }
+                self.shared.metrics.set_decoder(d.backend().name());
                 self.decoder = d;
             }
             Err(e) => {
@@ -745,6 +758,7 @@ impl DecodeLoop {
             let _ = std::io::Write::write_all(d, &annexb);
         }
         let started = Instant::now();
+        self.decoder.set_lenient(self.lossy);
         let ok = self.decoder.decode(&annexb, self.pts, &mut |p| pictures.push(p));
         let slices = au.nalus.iter().filter(|n| hevc::is_slice(n)).count();
         let took = started.elapsed();
@@ -756,7 +770,11 @@ impl DecodeLoop {
             } else {
                 self.awaiting_idr = true;
             }
-            self.loss_keyframe(tile, self.epoch, KeyframeCause::DecodeError);
+            // A concealed incomplete access unit failing is the same loss,
+            // already asked for.
+            if au.complete {
+                self.loss_keyframe(tile, self.epoch, KeyframeCause::DecodeError);
+            }
         }
         let floor = self.pts - 256;
         self.origin.retain(|&p, _| p > floor);
@@ -797,8 +815,9 @@ impl DecodeLoop {
             if recovered {
                 self.shared.recovered_damaged.fetch_add(1, Ordering::Relaxed);
             }
-            if self.shared.op().after_loss == AfterLoss::Conceal {
-                // Pictures referencing this one are smeared too.
+            if self.shared.op().after_loss == AfterLoss::Conceal && epoch == self.epoch {
+                // Pictures referencing this one are smeared too (unless a
+                // keyframe was fed since).
                 self.lossy = true;
             }
             // Repaired by the next IRAP after this picture's, not by the
@@ -868,6 +887,7 @@ pub(super) fn decoder(shared: Arc<Shared>, rx: Receiver<DecoderMsg>, fb: Sender<
         }
     };
     tracing::info!("video decoder: {:?}", decoder.backend());
+    shared.metrics.set_decoder(decoder.backend().name());
     let hw = decoder.backend().is_hw();
     let mut st = DecodeLoop {
         shared: shared.clone(),
@@ -901,18 +921,25 @@ pub(super) fn decoder(shared: Arc<Shared>, rx: Receiver<DecoderMsg>, fb: Sender<
                     st.flush(Flush::MaxHold);
                 }
             }
-            Ok(DecoderMsg::Reset) => {
-                // A new stream: an open outage belongs to the old one, and
-                // its recovery would be the adoption's.
-                shared.metrics.end_outage();
+            Ok(DecoderMsg::Reset(why)) => {
+                if why == ResetWhy::Adoption {
+                    // A new stream: an open outage belongs to the old one,
+                    // and its recovery would be the adoption's.
+                    shared.metrics.end_outage();
+                    // New SSRC group: new parameter sets will follow.
+                    st.params = ParamSets::default();
+                    st.active_sps = None;
+                }
+                // A stall reset keeps the outage open: the epoch carries on,
+                // so the next IRAP still ends it. It keeps the parameter
+                // sets too, as the host may send that IDR on the same SSRCs
+                // without repeating them; wiping them would refuse every
+                // keyframe from then on.
                 shared.metrics.shown(false);
                 st.irap_follow = 0;
                 st.lossy = false;
                 st.batch.clear();
                 st.batch_started = None;
-                // New SSRC group: new parameter sets will follow.
-                st.params = ParamSets::default();
-                st.active_sps = None;
                 st.restart(false);
             }
             Err(RecvTimeoutError::Timeout) => st.flush(Flush::Idle),
@@ -1102,7 +1129,7 @@ impl FeedbackSender {
         if stalled > STALL_RESET_MS && !self.stall_reset_done {
             tracing::warn!("video stalled for {} s; resetting decoder", stalled / 1000);
             self.stall_reset_done = true;
-            let _ = dec.send(DecoderMsg::Reset);
+            let _ = dec.send(DecoderMsg::Reset(ResetWhy::Stall));
         }
     }
 }
@@ -1216,7 +1243,7 @@ mod tests {
             .try_iter()
             .map(|m| match m {
                 DecoderMsg::Au { tile, au } => (tile, au.complete, au.nalus.len()),
-                DecoderMsg::Reset => panic!("unexpected reset"),
+                DecoderMsg::Reset(_) => panic!("unexpected reset"),
             })
             .collect();
         // The decoder sees it as lost (and then waits for a keyframe, or

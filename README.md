@@ -32,9 +32,7 @@ client window.
   briefly for the retransmission; keyframe requests, long-term-reference
   acks, and stall detection. `--hold auto` (default) stops holding once 20
   holds in a row go unfilled, since a host that doesn't retransmit makes
-  each hold pure delay; `on`/`off` fix it. `--recovery fir|pli|fir+pli`
-  picks the keyframe request, `--ltr on|off` long-term references, and
-  `--fps 60|30` the offered frame rate. `--after-loss idr` (default) drops
+  each hold pure delay; `on`/`off` fix it. `--after-loss idr` (default) drops
   pictures until the next keyframe, freezing the picture; `conceal` keeps
   decoding what arrived, so it keeps moving but smeared until then.
 
@@ -54,9 +52,13 @@ write commands to it, e.g. `echo 'hold off' > /tmp/macshare.ctl`:
 `render_scale 1|0.5`, `fps 60|30`, `recovery fir|pli|fir+pli`,
 `hold auto|on|off`, `ltr on|off`, `after_loss idr|conceal`, `keyframe`
 (ask for one now) and `restart` (reconnect with the current settings; with
-`--no-reconnect` it exits instead). `recovery`, `hold` and `after_loss`
-apply at once; `render_scale` re-requests the display like a resize; `fps`
-and `ltr` re-offer the media session on the open connection.
+`--no-reconnect` it exits instead). `recovery` (the keyframe request kind;
+default fir+pli), `ltr` (long-term references; default on) and `fps`
+(default 60) have no command-line flags: they are experiment knobs that
+made no measurable difference on a lossy link, because the Mac doesn't
+retransmit. `recovery`, `hold` and `after_loss` apply at once;
+`render_scale` re-requests the display like a resize; `fps` and `ltr`
+re-offer the media session on the open connection.
 
 ## Requirements
 

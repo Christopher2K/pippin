@@ -27,8 +27,6 @@ use clap::Parser;
 
 use proto::handshake::SessionMode;
 use rtp::assembler::HoldMode;
-use rtp::rtcp::Recovery;
-use session::Fps;
 use video::decoder::DecoderKind;
 
 #[derive(Parser)]
@@ -77,22 +75,10 @@ struct Cli {
     /// renders whole scales, so 0.5 needs a Retina (2x) window.
     #[arg(long, default_value_t = 1.0)]
     render_scale: f64,
-    /// Frame rate to offer. 30 clears the host's 60 fps stream flags:
-    /// fewer pictures to lose and decode on a bad link.
-    #[arg(long, value_enum, default_value_t = Fps::Sixty)]
-    fps: Fps,
-    /// Keyframe request sent when a tile loses a picture: FIR (AVPF and
-    /// legacy), PLI, or all three together.
-    #[arg(long, value_enum, default_value_t = Recovery::FirPli)]
-    recovery: Recovery,
     /// Hold frames with missing packets for NACK retransmissions. auto stops
     /// holding when the host doesn't retransmit.
     #[arg(long, value_enum, default_value_t = HoldMode::Auto)]
     hold: HoldMode,
-    /// Long-term reference pictures: offer them and acknowledge clean
-    /// frames, so the host may recover from loss without a keyframe.
-    #[arg(long, default_value = "on", value_name = "on|off", action = clap::ArgAction::Set, value_parser = session::parse_on_off)]
-    ltr: bool,
     /// What to show between a loss and the next keyframe: idr freezes the
     /// picture (drops everything until the keyframe); conceal keeps decoding
     /// whatever arrived, so the picture keeps moving but is smeared.
@@ -361,10 +347,13 @@ fn connect(
         resumed: false,
         op: Arc::new(parking_lot::Mutex::new(session::OperatingPoint {
             render_scale: cli.render_scale,
-            fps: cli.fps,
-            recovery: cli.recovery,
+            // Frame rate, keyframe request kind and LTR are experiment
+            // knobs on the control FIFO only; none made a measurable
+            // difference on a lossy link, as the Mac doesn't retransmit.
+            fps: session::Fps::Sixty,
+            recovery: rtp::rtcp::Recovery::FirPli,
             hold: cli.hold,
-            ltr: cli.ltr,
+            ltr: true,
             after_loss: cli.after_loss,
         })),
         stats_json: cli.stats_json.clone(),
