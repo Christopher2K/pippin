@@ -18,7 +18,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::platform::run_on_demand::EventLoopExtRunOnDemand;
-use winit::window::{CursorIcon, CustomCursor, Window, WindowId};
+use winit::window::{CursorIcon, CustomCursor, Window, WindowAttributes, WindowId};
 
 use crate::proto::messages::{BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN_SCROLL_DOWN, BTN_SCROLL_UP, DisplayRequest};
 use crate::session::{Config, CursorShape, Event, EventSink, Session};
@@ -269,12 +269,21 @@ impl App {
     }
 }
 
+/// Window attributes carrying the app id (Wayland) and WM_CLASS (X11), so
+/// desktops match windows to `pippin.desktop`.
+pub(crate) fn app_window_attributes() -> WindowAttributes {
+    use winit::platform::{wayland::WindowAttributesExtWayland, x11::WindowAttributesExtX11};
+    let attrs = Window::default_attributes();
+    let attrs = WindowAttributesExtWayland::with_name(attrs, "pippin", "pippin");
+    WindowAttributesExtX11::with_name(attrs, "pippin", "pippin")
+}
+
 impl ApplicationHandler<Tagged> for App {
     fn resumed(&mut self, el: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
         }
-        let attrs = Window::default_attributes()
+        let attrs = app_window_attributes()
             .with_title(format!("{} — connecting…", self.opts.title))
             .with_inner_size(LogicalSize::new(self.opts.size.0, self.opts.size.1));
         let window = match el.create_window(attrs) {

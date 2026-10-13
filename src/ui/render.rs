@@ -117,7 +117,7 @@ impl Renderer {
         .context("no GPU adapter for this window")?;
         tracing::info!("GPU: {} ({:?})", adapter.get_info().name, adapter.get_info().backend);
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("macshare"),
+            label: Some("pippin"),
             required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
             ..Default::default()
         }))

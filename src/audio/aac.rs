@@ -4,7 +4,7 @@
 //! 48 kHz stereo, 480 frames (10 ms) each; silence is sent as 4-byte
 //! all-zero units. FFmpeg has no AAC-ELD decoder, so libfdk-aac is the only
 //! choice on Linux. It's loaded with dlopen rather than linked so it stays
-//! optional: without it macshare runs without sound.
+//! optional: without it pippin runs without sound.
 
 use std::ffi::{c_int, c_uint, c_void};
 use std::sync::OnceLock;

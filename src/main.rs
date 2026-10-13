@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (C) 2026 macshare contributors. Protocol knowledge derived from
+// Copyright (C) 2026 pippin contributors. Protocol knowledge derived from
 // iShareScreen (https://github.com/renegadelink/iShareScreen), AGPL-3.0-or-later.
 
-//! macshare: a native client for macOS Screen Sharing's high-performance
+//! pippin: a native client for macOS Screen Sharing's high-performance
 //! (HEVC) mode.
 
 mod audio;
@@ -37,7 +37,7 @@ struct Cli {
     /// dialog when missing and there is no terminal.
     host: Option<String>,
     /// macOS account name.
-    #[arg(short, long, env = "MACSHARE_USER")]
+    #[arg(short, long, env = "PIPPIN_USER")]
     user: Option<String>,
     /// Always show the connect dialog, even with a terminal or a stored
     /// password. It's shown anyway when something is missing and stdin
@@ -45,7 +45,7 @@ struct Cli {
     #[arg(long)]
     dialog: bool,
     /// Account password. Otherwise taken from the keyring or prompted for.
-    #[arg(long, env = "MACSHARE_PASSWORD", hide_env_values = true)]
+    #[arg(long, env = "PIPPIN_PASSWORD", hide_env_values = true)]
     password: Option<String>,
     /// Read the password from the first line of stdin.
     #[arg(long, conflicts_with = "password")]
@@ -104,7 +104,7 @@ struct Cli {
     no_hw: bool,
     /// DRM render node for VAAPI decoding, e.g. /dev/dri/renderD129.
     /// Default: FFmpeg's choice.
-    #[arg(long, env = "MACSHARE_VAAPI_DEVICE")]
+    #[arg(long, env = "PIPPIN_VAAPI_DEVICE")]
     vaapi_device: Option<String>,
     /// Software decode threads. Pictures are split by CTU row (wavefront),
     /// so more threads add no latency; gains level off around 4-5.
@@ -121,7 +121,7 @@ struct Cli {
     #[arg(long)]
     no_warmup: bool,
     /// Exit when the connection drops instead of reconnecting. This also
-    /// makes `restart` on the MACSHARE_CONTROL_FIFO exit.
+    /// makes `restart` on the PIPPIN_CONTROL_FIFO exit.
     #[arg(long)]
     no_reconnect: bool,
     /// More logging; repeat for debug output.
@@ -157,12 +157,12 @@ fn main() -> std::process::ExitCode {
             // Session failures arrive already classified; full chains for
             // everything are at debug level.
             tracing::debug!("{e:?}");
-            eprintln!("macshare: {e:#}");
+            eprintln!("pippin: {e:#}");
             if !std::io::stdin().is_terminal() {
                 // Launched from a desktop entry: stderr goes nowhere, so try
                 // a notification. Missing notify-send is fine.
                 let _ = std::process::Command::new("notify-send")
-                    .args(["macshare", &format!("{e:#}")])
+                    .args(["pippin", &format!("{e:#}")])
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
@@ -176,9 +176,9 @@ fn main() -> std::process::ExitCode {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     let default_filter = match cli.verbose {
-        0 => "macshare=info,wgpu=error,naga=error",
-        1 => "macshare=debug,wgpu=warn",
-        _ => "macshare=trace,wgpu=info",
+        0 => "pippin=info,wgpu=error,naga=error",
+        1 => "pippin=debug,wgpu=warn",
+        _ => "pippin=trace,wgpu=info",
     };
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -378,11 +378,11 @@ fn connect(
         stats_json: cli.stats_json.clone(),
         // Debug only: switch operating-point levers mid-session by writing
         // lines such as `fps 30` or `hold off` to this FIFO.
-        control_fifo: std::env::var_os("MACSHARE_CONTROL_FIFO").map(PathBuf::from),
+        control_fifo: std::env::var_os("PIPPIN_CONTROL_FIFO").map(PathBuf::from),
         audio: audio.clone(),
     };
     let opts = ui::Options {
-        title: format!("{host_name} — macshare"),
+        title: format!("{host_name} — pippin"),
         host_name: host_name.to_owned(),
         size: cli.size,
         scale: cli.scale,

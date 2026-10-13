@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (C) 2026 macshare contributors.
+// Copyright (C) 2026 pippin contributors.
 
 //! Password resolution and storage in the desktop keyring (Secret Service).
 //! Keyring trouble is only ever a warning; the prompt is always the fallback.
@@ -8,12 +8,12 @@ use std::io::BufRead;
 
 use anyhow::{Context, Result, bail};
 
-const SERVICE: &str = "macshare";
+const SERVICE: &str = "pippin";
 
 /// Where the password came from, which decides what happens after auth.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
-    /// `--password` or `MACSHARE_PASSWORD`.
+    /// `--password` or `PIPPIN_PASSWORD`.
     Explicit,
     Stdin,
     Keyring,

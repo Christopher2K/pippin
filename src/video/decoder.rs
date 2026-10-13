@@ -563,7 +563,7 @@ mod tests {
 
     fn decode_file(path: &str, backend: Backend, threads: u32) -> Option<Decoded> {
         let data = std::fs::read(path).unwrap();
-        let vaapi_device = std::env::var("MACSHARE_VAAPI_DEVICE").ok();
+        let vaapi_device = std::env::var("PIPPIN_VAAPI_DEVICE").ok();
         let opts = DecoderOptions { kind: DecoderKind::Auto, threads, vaapi_device };
         let mut d = match Decoder::open_first(&[backend], &opts) {
             Ok(d) => d,
@@ -583,14 +583,14 @@ mod tests {
         Some(Decoded { backend: d.backend(), broken: d.broken(), layout, dims, samples: pics })
     }
 
-    /// Needs sample streams: MACSHARE_TEST_HEVC_DIR containing t444.hevc and
+    /// Needs sample streams: PIPPIN_TEST_HEVC_DIR containing t444.hevc and
     /// t420.hevc (1280x720, 30 frames). Hardware backends that can't open
     /// are skipped; one that opens must either match software output
     /// exactly or report itself broken, so the session falls back.
     #[test]
     #[ignore]
     fn decodes_sample_streams() {
-        let dir = std::env::var("MACSHARE_TEST_HEVC_DIR").expect("MACSHARE_TEST_HEVC_DIR");
+        let dir = std::env::var("PIPPIN_TEST_HEVC_DIR").expect("PIPPIN_TEST_HEVC_DIR");
         let runs = [(Backend::Software, 1), (Backend::Software, 4), (Backend::Cuda, 1), (Backend::Vaapi, 1)];
         for (file, chroma) in [("t444.hevc", (1280, 720)), ("t420.hevc", (640, 360))] {
             let path = format!("{dir}/{file}");
@@ -624,7 +624,7 @@ mod tests {
         }
     }
 
-    /// Streams a hardware decoder may not take, from MACSHARE_TEST_HEVC_DIR
+    /// Streams a hardware decoder may not take, from PIPPIN_TEST_HEVC_DIR
     /// if present: t444p10.hevc (yuv444p10, 1280x720: downloads in a format
     /// we can't show) and twide.hevc (yuv420p, 8448x256: past NVDEC's width
     /// limit, so libavcodec decodes in software). Whatever a hardware
@@ -632,7 +632,7 @@ mod tests {
     #[test]
     #[ignore]
     fn hw_rejects_unsupported_streams() {
-        let dir = std::env::var("MACSHARE_TEST_HEVC_DIR").expect("MACSHARE_TEST_HEVC_DIR");
+        let dir = std::env::var("PIPPIN_TEST_HEVC_DIR").expect("PIPPIN_TEST_HEVC_DIR");
         for file in ["t444p10.hevc", "twide.hevc"] {
             let path = format!("{dir}/{file}");
             if !std::path::Path::new(&path).exists() {
@@ -656,13 +656,13 @@ mod tests {
         }
     }
 
-    /// Times software decoding of a captured stream (MACSHARE_DUMP_HEVC)
+    /// Times software decoding of a captured stream (PIPPIN_DUMP_HEVC)
     /// at several thread counts:
-    /// MACSHARE_BENCH_HEVC=stream.hevc cargo test --release bench -- --ignored --nocapture
+    /// PIPPIN_BENCH_HEVC=stream.hevc cargo test --release bench -- --ignored --nocapture
     #[test]
     #[ignore]
     fn bench_threads() {
-        let path = std::env::var("MACSHARE_BENCH_HEVC").expect("MACSHARE_BENCH_HEVC");
+        let path = std::env::var("PIPPIN_BENCH_HEVC").expect("PIPPIN_BENCH_HEVC");
         let aus = access_units(&std::fs::read(path).unwrap());
         for threads in [1, 2, 3, 4, 5, 6, 8] {
             let opts = DecoderOptions { kind: DecoderKind::Software, threads, vaapi_device: None };

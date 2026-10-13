@@ -1,10 +1,14 @@
 [package]
-name = "macshare"
+name = "pippin"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.95"
 license = "AGPL-3.0-or-later"
-description = "Native client for macOS high-performance Screen Sharing"
-repository = "https://github.com/jonesy827/macshare"
+description = "Linux client for macOS high-performance Screen Sharing"
+repository = "https://github.com/jonesy827/pippin"
+readme = "README.md"
+keywords = ["vnc", "screen-sharing", "remote-desktop", "macos", "hevc"]
+categories = ["network-programming", "multimedia::video"]
 
 [dependencies]
 aes = "0.8"

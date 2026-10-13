@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Pippin
+GenericName=Remote Desktop
+Comment=Connect to a Mac's Screen Sharing in high-performance mode
+Exec=pippin
+Icon=pippin
+Terminal=false
+Categories=Network;RemoteAccess;
+Keywords=mac;macos;screen;sharing;vnc;remote;desktop;
+StartupWMClass=pippin

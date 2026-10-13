@@ -1895,52 +1895,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "macshare"
-version = "0.1.0"
-dependencies = [
- "aes",
- "anyhow",
- "arboard",
- "bindgen 0.73.2",
- "bytemuck",
- "cbc",
- "cipher",
- "clap",
- "cpal",
- "crossbeam-channel",
- "ctr",
- "egui",
- "egui-wgpu",
- "egui-winit",
- "flate2",
- "hmac",
- "image",
- "keyring",
- "libc",
- "libloading",
- "num-bigint",
- "num-traits",
- "parking_lot",
- "pbkdf2",
- "pkg-config",
- "plist",
- "pollster",
- "rand",
- "rpassword",
- "rsa",
- "sha1",
- "sha2",
- "socket2",
- "thiserror 2.0.21",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "wgpu",
- "winit",
- "wl-clipboard-rs",
-]
-
-[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2779,6 +2733,52 @@ dependencies = [
  "atomic-waker",
  "fastrand",
  "futures-io",
+]
+
+[[package]]
+name = "pippin"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "anyhow",
+ "arboard",
+ "bindgen 0.73.2",
+ "bytemuck",
+ "cbc",
+ "cipher",
+ "clap",
+ "cpal",
+ "crossbeam-channel",
+ "ctr",
+ "egui",
+ "egui-wgpu",
+ "egui-winit",
+ "flate2",
+ "hmac",
+ "image",
+ "keyring",
+ "libc",
+ "libloading",
+ "num-bigint",
+ "num-traits",
+ "parking_lot",
+ "pbkdf2",
+ "pkg-config",
+ "plist",
+ "pollster",
+ "rand",
+ "rpassword",
+ "rsa",
+ "sha1",
+ "sha2",
+ "socket2",
+ "thiserror 2.0.21",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "wgpu",
+ "winit",
+ "wl-clipboard-rs",
 ]
 
 [[package]]

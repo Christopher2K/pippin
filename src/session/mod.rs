@@ -12,7 +12,7 @@
 //! * `feedback` sends RTCP (receiver reports, keyframe requests, NACKs, LTR
 //!   acks), the audio keepalive and the cursor poll on a 500 ms tick.
 //! * `clipboard` mirrors text between the local and remote pasteboards.
-//! * `control-fifo` (debug, `MACSHARE_CONTROL_FIFO`) switches the operating
+//! * `control-fifo` (debug, `PIPPIN_CONTROL_FIFO`) switches the operating
 //!   point mid-session; `stats-json` (`--stats-json`) writes metrics.
 
 mod control;

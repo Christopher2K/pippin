@@ -627,20 +627,20 @@ struct DecodeLoop {
     last_input: Instant,
     gather: GatherStats,
     stats: DecodeStats,
-    /// MACSHARE_DUMP_HEVC: every access unit fed to the decoder, as Annex B,
+    /// PIPPIN_DUMP_HEVC: every access unit fed to the decoder, as Annex B,
     /// for offline analysis (ffmpeg -bsf:v trace_headers) and benchmarks.
     dump: Option<std::io::BufWriter<std::fs::File>>,
 }
 
 fn open_dump() -> Option<std::io::BufWriter<std::fs::File>> {
-    let path = std::env::var_os("MACSHARE_DUMP_HEVC")?;
+    let path = std::env::var_os("PIPPIN_DUMP_HEVC")?;
     match std::fs::File::create(&path) {
         Ok(f) => {
             tracing::info!("writing decoder input to {}", path.to_string_lossy());
             Some(std::io::BufWriter::new(f))
         }
         Err(e) => {
-            tracing::warn!("MACSHARE_DUMP_HEVC: {e}");
+            tracing::warn!("PIPPIN_DUMP_HEVC: {e}");
             None
         }
     }

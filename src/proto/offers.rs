@@ -253,7 +253,7 @@ fn media_blob(mode: i64, session_id: u32, audio: bool, ltr: bool) -> Vec<u8> {
         .int(1, 1)
         .int(2, 1)
         .raw(&desc)
-        .bytes(6, concat!("macshare ", env!("CARGO_PKG_VERSION")).as_bytes())
+        .bytes(6, concat!("pippin ", env!("CARGO_PKG_VERSION")).as_bytes())
         .int(8, 0)
         .raw(&tiers)
         .int(13, timestamp)

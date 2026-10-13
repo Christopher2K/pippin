@@ -107,7 +107,7 @@ pub fn set_display_configuration(req: &DisplayRequest) -> Vec<u8> {
     let put32 = |d: &mut [u8], off: usize, v: u32| d[off..off + 4].copy_from_slice(&v.to_be_bytes());
 
     put16(&mut di, 0, di_size as u16);
-    let name = b"macshare Virtual Display";
+    let name = b"Pippin Virtual Display";
     di[2..2 + name.len()].copy_from_slice(name);
     put32(&mut di, 0x7A, 1); // dynamic resolution
     put32(&mut di, 0x7E, 4); // virtual display

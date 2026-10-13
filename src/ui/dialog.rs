@@ -93,8 +93,8 @@ impl Dialog {
     }
 
     fn create(&mut self, el: &ActiveEventLoop) -> Result<Gpu> {
-        let attrs = Window::default_attributes()
-            .with_title("Connect — macshare")
+        let attrs = super::app_window_attributes()
+            .with_title("Connect — pippin")
             .with_inner_size(LogicalSize::new(400.0, if self.error.is_some() { 250.0 } else { 220.0 }))
             .with_resizable(false);
         let window = Arc::new(el.create_window(attrs).context("creating dialog window")?);
@@ -106,7 +106,7 @@ impl Dialog {
         }))
         .context("no GPU adapter for the dialog")?;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("macshare dialog"),
+            label: Some("pippin dialog"),
             required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
             ..Default::default()
         }))

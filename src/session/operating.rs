@@ -15,7 +15,7 @@
 //!   unverified. If the stream keeps its old rate, `restart` reconnects,
 //!   and the new session offers the current operating point from the start.
 //!
-//! A debug control FIFO (`MACSHARE_CONTROL_FIFO=/path`) takes one command
+//! A debug control FIFO (`PIPPIN_CONTROL_FIFO=/path`) takes one command
 //! per line; see [`parse_command`].
 
 use std::fmt;
@@ -266,7 +266,7 @@ pub(super) fn control_fifo(shared: Arc<Shared>, path: PathBuf, fb: Sender<Feedba
     let mut f = match open_fifo(&path) {
         Ok(f) => f,
         Err(e) => {
-            tracing::warn!("MACSHARE_CONTROL_FIFO {}: {e}", path.display());
+            tracing::warn!("PIPPIN_CONTROL_FIFO {}: {e}", path.display());
             return;
         }
     };
@@ -352,7 +352,7 @@ mod tests {
 
     #[test]
     fn opens_fifo_without_a_writer() {
-        let path = std::env::temp_dir().join(format!("macshare-fifo-test-{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("pippin-fifo-test-{}", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let mut f = open_fifo(&path).expect("created and opened");
         let mut buf = [0u8; 16];
