@@ -50,7 +50,7 @@ sudo dnf install gcc pkgconf-pkg-config clang clang-devel libavcodec-free-devel 
 Then install the binary via Cargo:
 
 ```sh
-cargo install --locked --git [https://github.com/jonesy827/pippin](https://github.com/jonesy827/pippin)
+cargo install --locked --git https://github.com/jonesy827/pippin
 ```
 
 *Optional:* `cargo install` only installs the binary. To launch `pippin` from your desktop application menu, install the `.desktop` entry and icon from a local checkout of this repository:
@@ -79,6 +79,7 @@ When prompted interactively, `pippin` offers to save your password to the deskto
 
 | Flag | Description |
 |---|---|
+| `--dialog` | Always show the connect dialog, even from a terminal or when a password is saved. Without it, the dialog appears only when there's no terminal (e.g. launched from the app menu) and something is missing. |
 | `--session share\|alt` | Share the active user's screen (default), or log into a separate background session. |
 | `--scale N` | Set display scale. Defaults to `2` on HiDPI screens, `1` otherwise. |
 | `--no-auto-resize` | Keep the Mac's display resolution fixed instead of resizing with the window. |
