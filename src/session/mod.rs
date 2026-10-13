@@ -32,7 +32,6 @@ use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender};
 use parking_lot::Mutex;
 
-use crate::codec::Codec;
 use crate::proto::auth::AuthError;
 use crate::proto::handshake::{self, ConnectParams, SessionMode};
 use crate::proto::messages::{self, DisplayRequest};
@@ -65,8 +64,6 @@ pub struct Config {
     pub user: String,
     pub password: String,
     pub session_mode: SessionMode,
-    /// Video codec to ask the host for.
-    pub codec: Codec,
     pub decoder: DecoderKind,
     /// DRM render node for VAAPI; None lets FFmpeg pick.
     pub vaapi_device: Option<String>,
@@ -214,8 +211,6 @@ pub struct Shared {
     last_frame: AtomicU64,
     /// When the media session was last re-offered (resize).
     renegotiated: AtomicU64,
-    /// When the host's display geometry last changed.
-    geometry_changed: AtomicU64,
     tile_ssrcs: Mutex<Vec<u32>>,
     /// RTCP receiver statistics per tile SSRC, for receiver reports.
     rx_stats: Mutex<HashMap<u32, ReceiverStats>>,
@@ -231,8 +226,6 @@ pub struct Shared {
     connecting: Mutex<Option<TcpStream>>,
     /// Clones of the media sockets, so shutdown() can wake their readers.
     udp: Mutex<Vec<UdpSocket>>,
-    /// The video codec asked for; fixed for the session.
-    codec: Codec,
     op: SharedOp,
     metrics: metrics::Metrics,
 }
@@ -279,21 +272,16 @@ impl Session {
     /// Starts connecting in the background. Progress and failures arrive as
     /// [`Event`]s.
     pub fn start(cfg: Config, display: DisplayRequest, sink: Arc<dyn EventSink>) -> Self {
-        // H.264 has no long-term references to offer or acknowledge.
-        if cfg.codec == Codec::H264 {
-            cfg.op.lock().ltr = false;
-        }
         let shared = Arc::new(Shared {
             clock: Clock(Instant::now()),
             stop: AtomicBool::new(false),
             control: OnceLock::new(),
             sink,
             frames: Arc::new(FrameStore::default()),
-            tiles: AtomicU32::new(crate::proto::offers::tiles_per_frame(cfg.codec) as u32),
+            tiles: AtomicU32::new(crate::proto::offers::TILES_PER_FRAME as u32),
             last_video_packet: AtomicU64::new(0),
             last_frame: AtomicU64::new(0),
             renegotiated: AtomicU64::new(0),
-            geometry_changed: AtomicU64::new(0),
             tile_ssrcs: Mutex::new(Vec::new()),
             rx_stats: Mutex::new(HashMap::new()),
             sender_reports: Mutex::new(HashMap::new()),
@@ -302,7 +290,6 @@ impl Session {
             canvas: Mutex::new(None),
             connecting: Mutex::new(None),
             udp: Mutex::new(Vec::new()),
-            codec: cfg.codec,
             op: cfg.op.clone(),
             metrics: metrics::Metrics::default(),
         });
@@ -519,7 +506,6 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
         display,
         audio: false,
         offer: shared.op().offer_options(),
-        codec: cfg.codec,
         on_open: Some(Box::new({
             let shared = shared.clone();
             move |s: &TcpStream| {
@@ -535,7 +521,6 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
             move || shared.stopped()
         })),
     };
-    tracing::info!("asking for {} video", cfg.codec);
     let negotiated = handshake::connect(&params);
     punching.store(false, Ordering::Relaxed);
     let _ = punch.join();
@@ -591,14 +576,13 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
 
     {
         let (shared, fb, sock) = (shared.clone(), fb_tx.clone(), video_sock.try_clone()?);
-        let (key, dec_tx, codec) = (neg.offer.video_key_s, dec_tx.clone(), cfg.codec);
-        spawn(threads, "video-rx", move || media::video_rx(shared, sock, key, codec, dec_tx, fb));
+        let (key, dec_tx) = (neg.offer.video_key_s, dec_tx.clone());
+        spawn(threads, "video-rx", move || media::video_rx(shared, sock, key, dec_tx, fb));
     }
     {
         let (shared, fb) = (shared.clone(), fb_tx.clone());
         let opts = crate::video::decoder::DecoderOptions {
             kind: cfg.decoder,
-            codec: cfg.codec,
             threads: cfg.decode_threads,
             vaapi_device: cfg.vaapi_device.clone(),
         };

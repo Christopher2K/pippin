@@ -29,7 +29,6 @@ use crossbeam_channel::Sender;
 use parking_lot::Mutex;
 
 use super::{Event, Feedback, KeyframeCause, Shared};
-use crate::codec::Codec;
 use crate::proto::offers::OfferOptions;
 use crate::rtp::assembler::HoldMode;
 use crate::rtp::rtcp::Recovery;
@@ -91,9 +90,6 @@ pub struct OperatingPoint {
     pub ltr: bool,
     /// Fast.
     pub after_loss: AfterLoss,
-    // A codec lever (--codec hevc|h264) belongs here too; it is slow, and
-    // likely needs `restart`, since the decoder has to change with it. With
-    // H.264 `ltr` stays off: it has no long-term references.
 }
 
 impl OperatingPoint {
@@ -207,11 +203,7 @@ pub fn parse_command(line: &str) -> Result<Option<Command>, String> {
 
 /// Moves the session to `new`: fast levers are read where they're used, so
 /// storing them is enough; slow ones start their renegotiation here.
-pub(super) fn apply(shared: &Shared, fb: &Sender<Feedback>, mut new: OperatingPoint) {
-    if new.ltr && shared.codec == Codec::H264 {
-        tracing::warn!("ltr stays off: H.264 has no long-term references");
-        new.ltr = false;
-    }
+pub(super) fn apply(shared: &Shared, fb: &Sender<Feedback>, new: OperatingPoint) {
     let old = std::mem::replace(&mut *shared.op_handle().lock(), new);
     if old == new {
         return;

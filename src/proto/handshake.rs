@@ -39,8 +39,6 @@ pub struct ConnectParams {
     pub display: DisplayRequest,
     pub audio: bool,
     pub offer: OfferOptions,
-    /// Video codec to ask the host for.
-    pub codec: crate::codec::Codec,
     /// Shown each control connection as soon as it's open, so the caller
     /// can shut it down to abort a handshake stuck waiting on the host.
     pub on_open: Option<Box<dyn Fn(&TcpStream) + Send + Sync>>,
@@ -322,7 +320,7 @@ pub fn connect(p: &ConnectParams) -> Result<Negotiated> {
     std::thread::sleep(Duration::from_millis(200));
     tracing::debug!("record layer active");
 
-    let offer = MediaOffer::generate(p.audio, p.session_mode == SessionMode::Alt, p.codec, p.offer);
+    let offer = MediaOffer::generate(p.audio, p.session_mode == SessionMode::Alt, p.offer);
     let offer_msg = offer.message();
     for m in [messages::set_encodings(), offer_msg.clone(), messages::fbu_request(false, 0, 0, 0xffff, 0xffff)] {
         s.write_all(&sealer.seal(&m))?;

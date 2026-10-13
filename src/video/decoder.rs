@@ -1,5 +1,5 @@
-//! HEVC and H.264 decoding through libavcodec, using NVDEC (CUDA) or VAAPI
-//! when available and falling back to the software decoder.
+//! HEVC decoding through libavcodec, using NVDEC (CUDA) or VAAPI when
+//! available and falling back to the software decoder.
 //!
 //! All tiles go through one decoder context: tiles are separate pictures in
 //! one coded sequence and reference each other. Output frames are mapped
@@ -12,7 +12,6 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use anyhow::{Result, anyhow, bail};
 
 use super::ffi::{self, AVPixelFormat as PixFmt};
-use crate::codec::Codec;
 
 /// One image plane: `rows` rows of `stride` bytes, of which the first
 /// `width * texel bytes` are pixels. The last row may be only that long.
@@ -114,7 +113,6 @@ pub enum DecoderKind {
 #[derive(Debug, Clone)]
 pub struct DecoderOptions {
     pub kind: DecoderKind,
-    pub codec: Codec,
     /// Software decoding threads. Apple's stream enables wavefront parallel
     /// processing with entry points, so slice threading splits each picture
     /// by CTU row without delaying output. Past ~5 threads the 16-row tiles
@@ -180,9 +178,6 @@ pub struct Decoder {
     backend: Backend,
     /// Pixel format of hardware frames, for hardware backends.
     hw_fmt: Option<PixFmt::Type>,
-    /// Frames libavcodec marks corrupt only for coming before its idea of a
-    /// recovery point are shown; see `open`.
-    show_unrecovered: bool,
     warned_format: bool,
     broken: bool,
     /// See [`Decoder::set_lenient`].
@@ -282,13 +277,9 @@ impl Decoder {
 
     fn open(backend: Backend, opts: &DecoderOptions) -> Result<Self> {
         unsafe {
-            let id = match opts.codec {
-                Codec::Hevc => ffi::AVCodecID::AV_CODEC_ID_HEVC,
-                Codec::H264 => ffi::AVCodecID::AV_CODEC_ID_H264,
-            };
-            let codec = ffi::avcodec_find_decoder(id);
+            let codec = ffi::avcodec_find_decoder(ffi::AVCodecID::AV_CODEC_ID_HEVC);
             if codec.is_null() {
-                bail!("libavcodec has no {} decoder", opts.codec);
+                bail!("libavcodec has no HEVC decoder");
             }
             let ctx = ffi::avcodec_alloc_context3(codec);
             if ctx.is_null() {
@@ -300,7 +291,6 @@ impl Decoder {
                 frame: ffi::av_frame_alloc(),
                 backend,
                 hw_fmt: None,
-                show_unrecovered: opts.codec == Codec::H264,
                 warned_format: false,
                 broken: false,
                 lenient: false,
@@ -311,13 +301,6 @@ impl Decoder {
             }
             (*ctx).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
             (*ctx).flags2 |= ffi::AV_CODEC_FLAG2_FAST as i32;
-            if dec.show_unrecovered {
-                // Apple's H.264 keyframes are mostly I slices, not IDRs, and
-                // libavcodec shows nothing after a non-IDR start until a
-                // recovery point it may never see. The session only feeds
-                // the decoder from a keyframe, so show those pictures.
-                (*ctx).flags |= ffi::AV_CODEC_FLAG_OUTPUT_CORRUPT as i32;
-            }
             let hw = match backend {
                 Backend::Cuda => Some((ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA, PixFmt::AV_PIX_FMT_CUDA, None)),
                 Backend::Vaapi => {
@@ -401,8 +384,7 @@ impl Decoder {
     unsafe fn extract(&mut self) -> Option<Picture> {
         unsafe {
             let f = self.frame;
-            let corrupt = ((*f).flags & ffi::AV_FRAME_FLAG_CORRUPT as i32) != 0;
-            let damaged = (*f).decode_error_flags != 0 || (corrupt && !self.show_unrecovered);
+            let damaged = (*f).decode_error_flags != 0 || ((*f).flags & ffi::AV_FRAME_FLAG_CORRUPT as i32) != 0;
             let pts = (*f).pts;
             // For hardware frames: whether the stream is 4:4:4. Drivers may
             // download other bit depths under an 8-bit format, so only
@@ -504,10 +486,11 @@ impl Drop for Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rtp::h264;
 
-    /// The NAL units of an Annex B stream.
-    fn nal_units(data: &[u8]) -> Vec<&[u8]> {
+    /// Splits an Annex B stream into access units (a new one starts at each
+    /// slice with `first_slice_segment_in_pic_flag`, or a parameter set
+    /// after slices).
+    fn access_units(data: &[u8]) -> Vec<Vec<u8>> {
         let mut starts = Vec::new();
         let mut i = 0;
         while i + 3 <= data.len() {
@@ -518,43 +501,29 @@ mod tests {
                 i += 1;
             }
         }
-        starts
-            .iter()
-            .enumerate()
-            .map(|(k, &s)| {
-                let mut end = starts.get(k + 1).map_or(data.len(), |&n| n - 3);
-                while end > s && data[end - 1] == 0 {
-                    end -= 1;
-                }
-                &data[s..end]
-            })
-            .collect()
-    }
-
-    /// Groups NAL units into Annex B access units (a new one starts at each
-    /// slice that begins a picture, or a non-VCL unit after slices).
-    fn group_access_units<'a>(nals: impl IntoIterator<Item = &'a [u8]>, codec: Codec) -> Vec<Vec<u8>> {
         let mut aus: Vec<Vec<u8>> = Vec::new();
         let mut cur = Vec::new();
         let mut cur_has_slice = false;
-        for nal in nals {
-            let slice = codec.is_slice(nal);
-            if cur_has_slice && (!slice || codec.first_in_picture(nal)) {
+        for (k, &s) in starts.iter().enumerate() {
+            let mut end = starts.get(k + 1).map_or(data.len(), |&n| n - 3);
+            while end > s && data[end - 1] == 0 {
+                end -= 1;
+            }
+            let nal = &data[s..end];
+            let t = (nal[0] >> 1) & 0x3f;
+            let first_slice = t <= 31 && nal.len() > 2 && nal[2] & 0x80 != 0;
+            if cur_has_slice && (first_slice || (32..=40).contains(&t)) {
                 aus.push(std::mem::take(&mut cur));
                 cur_has_slice = false;
             }
             cur.extend_from_slice(&[0, 0, 0, 1]);
             cur.extend_from_slice(nal);
-            cur_has_slice |= slice;
+            cur_has_slice |= t <= 31;
         }
         if !cur.is_empty() {
             aus.push(cur);
         }
         aus
-    }
-
-    fn access_units(data: &[u8]) -> Vec<Vec<u8>> {
-        group_access_units(nal_units(data), Codec::Hevc)
     }
 
     /// Y, U and V of a picture, unpacked to one byte per sample, so every
@@ -590,16 +559,12 @@ mod tests {
         layout: Option<Layout>,
         dims: Vec<(u32, u32, u32, u32)>,
         samples: Vec<[Vec<u8>; 3]>,
-        damaged: usize,
     }
 
     fn decode_file(path: &str, backend: Backend, threads: u32) -> Option<Decoded> {
-        decode_aus(&access_units(&std::fs::read(path).unwrap()), Codec::Hevc, backend, threads)
-    }
-
-    fn decode_aus(aus: &[Vec<u8>], codec: Codec, backend: Backend, threads: u32) -> Option<Decoded> {
+        let data = std::fs::read(path).unwrap();
         let vaapi_device = std::env::var("MACSHARE_VAAPI_DEVICE").ok();
-        let opts = DecoderOptions { kind: DecoderKind::Auto, codec, threads, vaapi_device };
+        let opts = DecoderOptions { kind: DecoderKind::Auto, threads, vaapi_device };
         let mut d = match Decoder::open_first(&[backend], &opts) {
             Ok(d) => d,
             Err(e) => {
@@ -607,92 +572,15 @@ mod tests {
                 return None;
             }
         };
-        let (mut layout, mut dims, mut pics, mut damaged) = (None, Vec::new(), Vec::new(), 0);
-        for (i, au) in aus.iter().enumerate() {
+        let (mut layout, mut dims, mut pics) = (None, Vec::new(), Vec::new());
+        for (i, au) in access_units(&data).iter().enumerate() {
             d.decode(au, i as i64, &mut |p: Picture| {
                 layout = Some(p.layout);
                 dims.push((p.width, p.height, p.chroma_width, p.chroma_height));
                 pics.push(samples(&p));
-                damaged += p.damaged as usize;
             });
         }
-        Some(Decoded { backend: d.backend(), broken: d.broken(), layout, dims, samples: pics, damaged })
-    }
-
-    /// H.264 access units the way the session feeds them: SPS patched for
-    /// Apple's reference count, starting from the `skip_keyframes`th
-    /// keyframe (with the parameter sets kept).
-    fn h264_access_units(path: &str, skip_keyframes: usize) -> Vec<Vec<u8>> {
-        let data = std::fs::read(path).unwrap();
-        let nals = nal_units(&data);
-        let params: Vec<Vec<u8>> =
-            nals.iter().filter(|n| h264::is_param_set(n)).map(|n| h264::patch_sps_dpb(n)).collect();
-        let from = nals
-            .iter()
-            .enumerate()
-            .filter(|(_, n)| h264::is_keyframe(n) && h264::first_in_picture(n))
-            .nth(skip_keyframes)
-            .map(|(i, _)| i)
-            .expect("not enough keyframes");
-        let rest = nals[from..].iter().copied().filter(|n| !h264::is_param_set(n));
-        group_access_units(params.iter().map(|p| p.as_slice()).chain(rest), Codec::H264)
-    }
-
-    /// Needs MACSHARE_TEST_HEVC_DIR containing t264.h264 (1280x720 4:2:0,
-    /// 30 frames). Its SPS is patched as the session does. Every backend
-    /// that opens must match software output. x264's B-frames leave the
-    /// last two pictures in the reorder buffer, since nothing flushes it.
-    #[test]
-    #[ignore]
-    fn decodes_h264_stream() {
-        let dir = std::env::var("MACSHARE_TEST_HEVC_DIR").expect("MACSHARE_TEST_HEVC_DIR");
-        let aus = h264_access_units(&format!("{dir}/t264.h264"), 0);
-        let reference = decode_aus(&aus, Codec::H264, Backend::Software, 1).unwrap();
-        assert!(reference.dims.len() >= 28 && reference.damaged == 0, "{}", reference.dims.len());
-        for (backend, threads) in [(Backend::Software, 4), (Backend::Cuda, 1), (Backend::Vaapi, 1)] {
-            let Some(got) = decode_aus(&aus, Codec::H264, backend, threads) else {
-                eprintln!("t264 {backend:?}: unavailable");
-                continue;
-            };
-            eprintln!(
-                "t264 {backend:?} threads={threads}: {:?}{}, {} pictures ({} damaged), {:?}",
-                got.backend,
-                if got.broken { " (broken: would fall back)" } else { "" },
-                got.dims.len(),
-                got.damaged,
-                got.layout,
-            );
-            assert!(!got.broken, "{backend:?} can't show H.264 4:2:0");
-            assert!(got.dims.len() >= 25 && got.damaged == 0, "{backend:?}");
-            assert!(got.dims.iter().all(|&p| p == (1280, 720, 640, 360)));
-            for (k, (a, b)) in got.samples.iter().zip(&reference.samples).enumerate() {
-                assert!(a == b, "t264 {backend:?}: picture {k} differs from software");
-            }
-        }
-    }
-
-    /// Starting from a non-IDR I picture, as Apple's H.264 keyframes mostly
-    /// are, still shows pictures. Needs t264open.h264 in
-    /// MACSHARE_TEST_HEVC_DIR: open GOPs, 4 references and no SEI, so
-    /// libavcodec sees no recovery point:
-    /// ffmpeg -f lavfi -i testsrc2=size=1280x720 -frames:v 60 -c:v libx264 -bf 2
-    ///   -x264-params keyint=20:min-keyint=20:open-gop=1:scenecut=0:ref=4
-    ///   -pix_fmt yuv420p -bsf:v filter_units=remove_types=6 -f h264 t264open.h264
-    #[test]
-    #[ignore]
-    fn h264_starts_from_non_idr_keyframe() {
-        let dir = std::env::var("MACSHARE_TEST_HEVC_DIR").expect("MACSHARE_TEST_HEVC_DIR");
-        let path = format!("{dir}/t264open.h264");
-        if !std::path::Path::new(&path).exists() {
-            eprintln!("t264open.h264: missing");
-            return;
-        }
-        let aus = h264_access_units(&path, 1);
-        for backend in [Backend::Software, Backend::Cuda, Backend::Vaapi] {
-            let Some(got) = decode_aus(&aus, Codec::H264, backend, 1) else { continue };
-            eprintln!("t264open {backend:?}: {} of {} pictures, {} damaged", got.dims.len(), aus.len(), got.damaged);
-            assert!(got.dims.len() + 4 >= aus.len(), "{backend:?}");
-        }
+        Some(Decoded { backend: d.backend(), broken: d.broken(), layout, dims, samples: pics })
     }
 
     /// Needs sample streams: MACSHARE_TEST_HEVC_DIR containing t444.hevc and
@@ -777,7 +665,7 @@ mod tests {
         let path = std::env::var("MACSHARE_BENCH_HEVC").expect("MACSHARE_BENCH_HEVC");
         let aus = access_units(&std::fs::read(path).unwrap());
         for threads in [1, 2, 3, 4, 5, 6, 8] {
-            let opts = DecoderOptions { kind: DecoderKind::Software, codec: Codec::Hevc, threads, vaapi_device: None };
+            let opts = DecoderOptions { kind: DecoderKind::Software, threads, vaapi_device: None };
             let mut d = Decoder::new(&opts).unwrap();
             let mut pics = 0;
             let started = std::time::Instant::now();
