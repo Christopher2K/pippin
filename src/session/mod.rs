@@ -447,9 +447,10 @@ fn bind_udp(port: u16) -> Result<UdpSocket> {
         .with_context(|| format!("binding UDP port {port} (is another screen-sharing client running?)"))?;
     if let Ok(n) = s.recv_buffer_size()
         && n < 2 << 20 {
-            tracing::warn!(
-                "UDP receive buffer is only {n} bytes; raise net.core.rmem_max \
-                 (e.g. sysctl -w net.core.rmem_max=33554432) to avoid video loss"
+            // Only bursts after a switch to 4K have been seen to need more.
+            tracing::info!(
+                "UDP receive buffer is {n} bytes; for 4K, raise net.core.rmem_max \
+                 (e.g. sysctl -w net.core.rmem_max=8388608) to avoid drops after resolution switches"
             );
         }
     let s: UdpSocket = s.into();
