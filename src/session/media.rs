@@ -109,11 +109,11 @@ pub(super) fn video_rx(
                             }
                             next_seq.insert(p.ssrc, p.seq.wrapping_add(1));
                         }
-                        let at = shared.clock.0.elapsed();
+                        let (index, at) = (srtp.last_index(), shared.clock.0.elapsed());
                         match shared.rx_stats.lock().entry(p.ssrc) {
-                            Entry::Occupied(mut e) => e.get_mut().record(p.seq, p.ts, at),
+                            Entry::Occupied(mut e) => e.get_mut().record(index, p.ts, at),
                             Entry::Vacant(e) => {
-                                e.insert(ReceiverStats::new(p.seq, p.ts, at));
+                                e.insert(ReceiverStats::new(index, p.ts, at));
                             }
                         }
                     }
@@ -671,12 +671,12 @@ impl FeedbackSender {
         let hb = self.audio.protect(AUDIO_PT, &HEARTBEAT_PAYLOAD);
         let _ = self.s.ctrl.send_to(&hb, self.s.ctrl_dest);
 
+        let ssrcs = self.shared.tile_ssrcs.lock().clone();
+        let mut link = Vec::with_capacity(ssrcs.len());
         let sources: Vec<rtcp::ReportSource> = {
-            let ssrcs = self.shared.tile_ssrcs.lock().clone();
             let mut stats = self.shared.rx_stats.lock();
             let srs = self.shared.sender_reports.lock();
-            let mut link = Vec::with_capacity(ssrcs.len());
-            let sources = ssrcs
+            ssrcs
                 .iter()
                 .map(|&ssrc| {
                     let r = stats.get_mut(&ssrc).map(|s| {
@@ -693,10 +693,9 @@ impl FeedbackSender {
                         last_sr: srs.get(&ssrc).map(|&(mid, at)| (mid, at.elapsed().as_secs_f64())),
                     }
                 })
-                .collect();
-            self.link.record(&ssrcs, &link);
-            sources
+                .collect()
         };
+        self.link.record(&ssrcs, &link);
         let mut report = Vec::new();
         if n.is_multiple_of(SR_EVERY_TICKS) {
             report.extend(rtcp::empty_sender_report(self.our_ssrc));
