@@ -29,11 +29,13 @@ pippin my-mac.local -u alice
 
 ## Installation
 
-### Arch Linux (AUR)
-Install `pippin` (latest release) or `pippin-git` (latest commit) using your preferred AUR helper:
+### Arch Linux
+Official AUR packages (`pippin` and `pippin-git`) are ready and will be published as soon as AUR account registration reopens. In the meantime, you can build and install the `pacman` package directly from the repository (which includes the desktop entry and icon):
 
 ```sh
-yay -S pippin
+git clone https://github.com/jonesy827/pippin
+cd pippin/packaging/aur/pippin-git
+makepkg -si
 ```
 
 ### Cargo (All Other Distros)
