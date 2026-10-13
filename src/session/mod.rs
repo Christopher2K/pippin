@@ -189,6 +189,12 @@ pub struct Shared {
     /// RTCP receiver statistics per tile SSRC, for receiver reports.
     rx_stats: Mutex<HashMap<u32, ReceiverStats>>,
     sender_reports: Mutex<HashMap<u32, (u32, Instant)>>,
+    /// Smoothed round trip from host report blocks echoing our SRs; `None`
+    /// until the host sends one.
+    rtt: Mutex<Option<Duration>>,
+    /// Pictures decoded damaged from access units a hold had recovered,
+    /// since the video receiver last logged it.
+    recovered_damaged: AtomicU32,
     canvas: Mutex<Option<(u32, u32)>>,
     /// The control connection while the handshake runs, for shutdown().
     connecting: Mutex<Option<TcpStream>>,
@@ -242,6 +248,8 @@ impl Session {
             tile_ssrcs: Mutex::new(Vec::new()),
             rx_stats: Mutex::new(HashMap::new()),
             sender_reports: Mutex::new(HashMap::new()),
+            rtt: Mutex::new(None),
+            recovered_damaged: AtomicU32::new(0),
             canvas: Mutex::new(None),
             connecting: Mutex::new(None),
             udp: Mutex::new(Vec::new()),

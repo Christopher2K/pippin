@@ -28,8 +28,9 @@ client window.
   `software`); `--vaapi-device` or `MACSHARE_VAAPI_DEVICE` picks the render
   node, e.g. `/dev/dri/renderD129`. Decoded planes go to the GPU as-is
   (NV12/NV24 and packed VUYX included) and are converted in the shader.
-- **Loss recovery.** NACKs, keyframe requests, long-term-reference acks,
-  and stall detection.
+- **Loss recovery.** NACKs (retried once), with frames that have holes held
+  briefly for the retransmission; keyframe requests, long-term-reference
+  acks, and stall detection.
 
 ## Requirements
 

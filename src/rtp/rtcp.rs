@@ -1,9 +1,12 @@
 //! RTCP feedback builders (RR, SR, FIR, PLI, NACK, Apple LTR ack) and SR
 //! parsing.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const NTP_EPOCH_OFFSET: u64 = 2_208_988_800;
+/// Round-trip samples longer than this are taken to be bogus (e.g. a wall
+/// clock step between our SR and the report).
+const RTT_MAX: Duration = Duration::from_secs(1);
 
 fn ntp_now() -> (u32, u32) {
     let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
@@ -144,6 +147,47 @@ pub fn sender_reports(data: &[u8]) -> Vec<(u32, u32)> {
     out
 }
 
+/// Middle 32 bits of the current NTP time, the unit of LSR/DLSR.
+pub fn ntp_middle_now() -> u32 {
+    let (secs, frac) = ntp_now();
+    (secs << 16) | (frac >> 16)
+}
+
+/// Round-trip times from the report blocks about `ours` (the SSRC our SRs
+/// are sent as) in the SRs and RRs of a compound packet (RFC 3550 6.4.1:
+/// A - LSR - DLSR). `now` is [`ntp_middle_now`] at arrival.
+pub fn round_trips(data: &[u8], ours: u32, now: u32) -> Vec<Duration> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while pos + 4 <= data.len() {
+        let p = &data[pos..];
+        let len = (u16::from_be_bytes([p[2], p[3]]) as usize + 1) * 4;
+        if len > p.len() {
+            break;
+        }
+        let blocks = match p[1] {
+            200 => 28,
+            201 => 8,
+            _ => len,
+        };
+        let rc = (p[0] & 0x1f) as usize;
+        for b in p[..len].get(blocks..).unwrap_or_default().as_chunks::<24>().0.iter().take(rc) {
+            let ssrc = u32::from_be_bytes(b[0..4].try_into().unwrap());
+            let lsr = u32::from_be_bytes(b[16..20].try_into().unwrap());
+            let dlsr = u32::from_be_bytes(b[20..24].try_into().unwrap());
+            if ssrc != ours || lsr == 0 {
+                continue;
+            }
+            let rtt = Duration::from_secs_f64(now.wrapping_sub(lsr).wrapping_sub(dlsr) as f64 / 65536.0);
+            if rtt <= RTT_MAX {
+                out.push(rtt);
+            }
+        }
+        pos += len;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,5 +248,26 @@ mod tests {
     fn empty_rr_for_feedback() {
         let p = keyframe_request(9, 2, 1);
         assert_eq!(&p[..8], &[0x80, 201, 0, 1, 0, 0, 0, 9]);
+    }
+
+    #[test]
+    fn round_trip_from_report_block() {
+        // An RR echoing our SR sent at LSR, held 0.25 s by the host, back
+        // 0.3 s after we sent it.
+        let lsr = 0x1234_0000u32;
+        let mut rr = vec![0x81, 201, 0, 7, 0, 0, 0, 9];
+        for v in [1u32, 0, 0, 0, lsr, 0x4000] {
+            rr.extend_from_slice(&v.to_be_bytes());
+        }
+        let now = lsr + (0.3 * 65536.0) as u32;
+        let rtt = round_trips(&rr, 1, now);
+        assert_eq!(rtt.len(), 1);
+        assert!((rtt[0].as_secs_f64() - 0.05).abs() < 0.001);
+        // About another source, no SR echoed yet, a block that would go back
+        // in time, or one implausibly old.
+        assert!(round_trips(&rr, 2, now).is_empty());
+        assert!(round_trips(&rr[..8], 1, now).is_empty());
+        assert!(round_trips(&rr, 1, lsr).is_empty());
+        assert!(round_trips(&rr, 1, lsr + 2 * 65536).is_empty());
     }
 }

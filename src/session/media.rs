@@ -12,7 +12,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 
 use super::{Event, Shared};
 use crate::proto::offers::{MediaOffer, SRTP_BLOB_LEN};
-use crate::rtp::assembler::{AccessUnit, Assembler, TileMap};
+use crate::rtp::assembler::{AccessUnit, Assembler, POLL_EVERY, TileMap};
 use crate::rtp::srtp::{SrtcpReceiver, SrtcpSender, SrtpReceiver, SrtpSender};
 use crate::rtp::stats::{ReceiverStats, VIDEO_CLOCK_HZ};
 use crate::rtp::{hevc, rtcp};
@@ -42,7 +42,12 @@ pub(super) struct FeedbackSockets {
 }
 
 const NACK_MAX_GAP: u16 = 32;
-const EVICT_EVERY: Duration = Duration::from_millis(20);
+/// Cap on NACKed packets tracked for a retry.
+const NACK_PENDING_MAX: usize = 512;
+/// Weight of a new round-trip sample in the smoothed estimate.
+const RTT_GAIN: f64 = 0.125;
+/// Socket read timeout while nothing is pending, as set up in `bind_udp`.
+const IDLE_POLL: Duration = Duration::from_millis(100);
 const ADOPT_EVERY: Duration = Duration::from_millis(50);
 /// No decoded frame for this long allows switching to another SSRC group.
 const SWITCH_AFTER_STALL_MS: u64 = 2000;
@@ -57,11 +62,116 @@ fn is_rtcp(pkt: &[u8]) -> bool {
     pkt.len() >= 8 && (200..=207).contains(&(pkt[1] & 0x7f))
 }
 
+/// Keeps the host's sender reports (for our receiver reports) and folds any
+/// report blocks echoing our own SRs into the round-trip estimate.
 fn record_sender_reports(shared: &Shared, rtcp: &[u8]) {
     let now = Instant::now();
-    let mut srs = shared.sender_reports.lock();
-    for (ssrc, mid32) in rtcp::sender_reports(rtcp) {
-        srs.insert(ssrc, (mid32, now));
+    {
+        let mut srs = shared.sender_reports.lock();
+        for (ssrc, mid32) in rtcp::sender_reports(rtcp) {
+            srs.insert(ssrc, (mid32, now));
+        }
+    }
+    let Some(ours) = shared.control.get().map(|c| c.offer.video_ssrc) else {
+        return;
+    };
+    let samples = rtcp::round_trips(rtcp, ours, rtcp::ntp_middle_now());
+    if samples.is_empty() {
+        return;
+    }
+    let mut rtt = shared.rtt.lock();
+    if rtt.is_none() {
+        tracing::debug!("round trip {:.1} ms", samples[0].as_secs_f64() * 1000.0);
+    }
+    for s in samples {
+        *rtt = Some(rtt.map_or(s, |r| r.mul_f64(1.0 - RTT_GAIN) + s.mul_f64(RTT_GAIN)));
+    }
+}
+
+/// Sends access units to the decoder, or stashes those of SSRCs not yet
+/// adopted. False once the decoder is gone.
+fn route(tiles: &mut TileMap, dec: &Sender<DecoderMsg>, aus: Vec<AccessUnit>) -> bool {
+    for au in aus {
+        match tiles.tile_of(au.ssrc) {
+            Some(tile) => {
+                if dec.send(DecoderMsg::Au { tile, au }).is_err() {
+                    return false;
+                }
+            }
+            None => tiles.stash(au),
+        }
+    }
+    true
+}
+
+/// NACKs each still-missing packet once more `retry` after the first
+/// request, and forgets packets once the assembler (holding for `wait`) will
+/// have given up on them. Returns how many were retried.
+fn retry_nacks(
+    nacked: &mut HashMap<(u32, u16), (Instant, bool)>,
+    retry: Duration,
+    wait: Duration,
+    now: Instant,
+    fb: &Sender<Feedback>,
+) -> u32 {
+    let mut again: HashMap<u32, Vec<u16>> = HashMap::new();
+    nacked.retain(|&(ssrc, seq), (at, retried)| {
+        let age = now.duration_since(*at);
+        if age >= wait {
+            return false;
+        }
+        if !*retried && age >= retry {
+            *retried = true;
+            again.entry(ssrc).or_default().push(seq);
+        }
+        true
+    });
+    let mut n = 0;
+    for (ssrc, lost) in again {
+        tracing::trace!("NACK retry {ssrc:#010x}: {lost:?}");
+        n += lost.len() as u32;
+        let _ = fb.send(Feedback::Nack(ssrc, lost));
+    }
+    n
+}
+
+/// Loss recovery in the video receiver, logged every STATS_EVERY at debug
+/// level so the hold can be tuned against a real host.
+struct LossStats {
+    since: Instant,
+    nacked: u32,
+    retried: u32,
+}
+
+impl LossStats {
+    fn new() -> Self {
+        Self { since: Instant::now(), nacked: 0, retried: 0 }
+    }
+
+    fn log_if_due(&mut self, shared: &Shared, asm: &mut Assembler) {
+        if self.since.elapsed() < STATS_EVERY {
+            return;
+        }
+        let holds = asm.take_stats();
+        let damaged = shared.recovered_damaged.swap(0, Ordering::Relaxed);
+        if self.nacked > 0 || holds.started > 0 || holds.donl_backwards > 0 {
+            let rtt = match *shared.rtt.lock() {
+                Some(r) => format!("{:.1} ms", r.as_secs_f64() * 1000.0),
+                None => "unknown".into(),
+            };
+            tracing::debug!(
+                "loss: {} NACKed, {} retried; holds {} started, {} filled ({damaged} pictures damaged after), \
+                 {} given up; DONL backwards {}; rtt {rtt}, hold {} ms",
+                self.nacked,
+                self.retried,
+                holds.started,
+                holds.filled,
+                holds.given_up,
+                holds.donl_backwards,
+                asm.wait().as_millis(),
+            );
+        }
+        *self = Self::new();
     }
 }
 
@@ -78,8 +188,12 @@ pub(super) fn video_rx(
     let mut asm = Assembler::default();
     let mut tiles = TileMap::default();
     let mut next_seq: HashMap<u32, u16> = HashMap::new();
+    // NACKed packets not yet seen: when first requested, and whether retried.
+    let mut nacked: HashMap<(u32, u16), (Instant, bool)> = HashMap::new();
     let mut buf = vec![0u8; 65536];
     let mut last_evict = Instant::now();
+    let mut polling = false;
+    let mut loss = LossStats::new();
     let mut last_adopt = Instant::now();
     let mut bad = 0u64;
     let mut seen = std::collections::HashSet::new();
@@ -100,11 +214,17 @@ pub(super) fn video_rx(
                     tiles.count_packet(p.ssrc);
                     if tiles.tile_of(p.ssrc).is_some() {
                         // Gap detection for NACKs; the assembler deals with order.
+                        nacked.remove(&(p.ssrc, p.seq));
                         let expected = *next_seq.entry(p.ssrc).or_insert(p.seq);
                         let gap = p.seq.wrapping_sub(expected);
                         if gap < 0x8000 {
                             if gap > 0 && gap < NACK_MAX_GAP {
-                                let lost = (0..gap).map(|i| expected.wrapping_add(i)).collect();
+                                let lost: Vec<u16> = (0..gap).map(|i| expected.wrapping_add(i)).collect();
+                                loss.nacked += lost.len() as u32;
+                                if nacked.len() < NACK_PENDING_MAX {
+                                    let now = Instant::now();
+                                    nacked.extend(lost.iter().map(|&s| ((p.ssrc, s), (now, false))));
+                                }
                                 let _ = fb.send(Feedback::Nack(p.ssrc, lost));
                             }
                             next_seq.insert(p.ssrc, p.seq.wrapping_add(1));
@@ -117,15 +237,9 @@ pub(super) fn video_rx(
                             }
                         }
                     }
-                    if let Some(au) = asm.push(p) {
-                        match tiles.tile_of(au.ssrc) {
-                            Some(tile) => {
-                                if dec.send(DecoderMsg::Au { tile, au }).is_err() {
-                                    return;
-                                }
-                            }
-                            None => tiles.stash(au),
-                        }
+                    let aus = asm.push(p, Instant::now());
+                    if !route(&mut tiles, &dec, aus) {
+                        return;
                     }
                 } else if n > 1 {
                     bad += 1;
@@ -142,12 +256,24 @@ pub(super) fn video_rx(
         }
 
         let now = Instant::now();
-        if now.duration_since(last_evict) >= EVICT_EVERY {
+        if now.duration_since(last_evict) >= POLL_EVERY {
             last_evict = now;
-            for ssrc in asm.evict(now) {
-                if let Some(t) = tiles.tile_of(ssrc) {
-                    let _ = fb.send(Feedback::Keyframe(Some(t)));
-                }
+            if let Some(rtt) = *shared.rtt.lock() {
+                asm.set_rtt(rtt);
+            }
+            // Given-up access units come out incomplete; the decoder asks
+            // for the keyframe.
+            if !route(&mut tiles, &dec, asm.evict(now)) {
+                return;
+            }
+            loss.retried += retry_nacks(&mut nacked, asm.retry_after(), asm.wait(), now, &fb);
+            loss.log_if_due(&shared, &mut asm);
+            // Wake often enough to retry and give up on time even if the
+            // stream goes quiet, but not while idle.
+            let busy = asm.pending() || !nacked.is_empty();
+            if busy != polling {
+                polling = busy;
+                let _ = sock.set_read_timeout(Some(if busy { POLL_EVERY } else { IDLE_POLL }));
             }
         }
         if now.duration_since(last_adopt) >= ADOPT_EVERY {
@@ -159,8 +285,10 @@ pub(super) fn video_rx(
                 || (reneg != 0 && shared.since_ms(&shared.renegotiated) < SWITCH_AFTER_REOFFER_MS);
             if let Some(backlog) = tiles.try_adopt(want, allow_switch) {
                 let ssrcs = tiles.ssrcs().to_vec();
+                asm.link(&ssrcs);
                 srtp.forget(|s| ssrcs.contains(&s));
                 next_seq.clear();
+                nacked.clear();
                 *shared.tile_ssrcs.lock() = ssrcs;
                 shared.rx_stats.lock().clear();
                 shared.renegotiated.store(0, Ordering::Relaxed);
@@ -176,8 +304,9 @@ pub(super) fn video_rx(
     }
 }
 
-/// Drains the control/audio UDP port. Audio is not played; only sender
-/// reports are kept for round-trip estimates in our receiver reports.
+/// Drains the control/audio UDP port. Audio is not played; only RTCP is
+/// kept, for round-trip estimates (ours and the host's via our receiver
+/// reports).
 pub(super) fn ctrl_rx(shared: Arc<Shared>, sock: UdpSocket, key: [u8; SRTP_BLOB_LEN]) {
     let srtcp = SrtcpReceiver::new(&key);
     let mut buf = vec![0u8; 65536];
@@ -256,9 +385,15 @@ struct DecodeLoop {
     params: ParamSets,
     /// SPS the decoder was last started with.
     active_sps: Option<Vec<u8>>,
+    /// Decoder-wide, not per tile: the tiles are one coded sequence in one
+    /// DPB, fed in cross-SSRC decode order, and a P picture on one tile
+    /// references pictures of the others. IDRs come only on the base tile
+    /// and reset the DPB for all of them, so per-tile flags for the other
+    /// tiles would never clear.
     awaiting_idr: bool,
     pts: i64,
-    origin: HashMap<i64, (usize, Option<u16>)>,
+    /// Tile, DONL and whether a hold recovered it, per decoder input.
+    origin: HashMap<i64, (usize, Option<u16>, bool)>,
     fed_without_output: Option<u32>,
     /// No backend could be reopened; the session has been closed.
     dead: bool,
@@ -441,7 +576,7 @@ impl DecodeLoop {
         }
 
         self.pts += 1;
-        self.origin.insert(self.pts, (tile, au.donl));
+        self.origin.insert(self.pts, (tile, au.donl, au.recovered));
         let mut pictures = Vec::new();
         if let Some(d) = self.dump.as_mut() {
             let _ = std::io::Write::write_all(d, &annexb);
@@ -484,10 +619,13 @@ impl DecodeLoop {
     }
 
     fn publish(&mut self, pic: Picture) {
-        let Some((tile, donl)) = self.origin.remove(&pic.pts) else {
+        let Some((tile, donl, recovered)) = self.origin.remove(&pic.pts) else {
             return;
         };
         if pic.damaged {
+            if recovered {
+                self.shared.recovered_damaged.fetch_add(1, Ordering::Relaxed);
+            }
             let _ = self.fb.send(Feedback::Keyframe(Some(tile)));
         } else if let (0, Some(d)) = (tile, donl) {
             let _ = self.fb.send(Feedback::LtrAck(d));
@@ -794,5 +932,59 @@ pub(super) fn feedback(
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rtp::srtp::RtpPacket;
+
+    #[test]
+    fn retries_each_missing_packet_once() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        let (retry, wait) = (Duration::from_millis(11), Duration::from_millis(27));
+        let mut nacked = HashMap::from([((1, 5), (t0, false)), ((1, 6), (t0, false)), ((2, 9), (ms(5), false))]);
+        assert_eq!(retry_nacks(&mut nacked, retry, wait, ms(10), &tx), 0);
+        assert_eq!(retry_nacks(&mut nacked, retry, wait, ms(11), &tx), 2);
+        let Ok(Feedback::Nack(1, mut lost)) = rx.try_recv() else { panic!("expected a NACK for SSRC 1") };
+        lost.sort_unstable();
+        assert_eq!(lost, [5, 6]);
+        assert!(rx.try_recv().is_err());
+        // Not again; the later one gets its own retry.
+        assert_eq!(retry_nacks(&mut nacked, retry, wait, ms(16), &tx), 1);
+        let Ok(Feedback::Nack(2, lost)) = rx.try_recv() else { panic!("expected a NACK for SSRC 2") };
+        assert_eq!(lost, [9]);
+        // Forgotten once the assembler has given up on them.
+        retry_nacks(&mut nacked, retry, wait, ms(27), &tx);
+        assert_eq!(nacked.keys().collect::<Vec<_>>(), [&(2, 9)]);
+        retry_nacks(&mut nacked, retry, wait, ms(32), &tx);
+        assert!(nacked.is_empty());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn given_up_access_unit_reaches_decoder_incomplete() {
+        let t0 = Instant::now();
+        let mut asm = Assembler::default();
+        asm.link(&[7, 8]);
+        let mut tiles = TileMap::with_tiles(vec![7, 8]);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let p = |seq: u16, ts, marker| RtpPacket { ssrc: 8, seq, ts, marker, pt: 100, payload: vec![2, 1, 0, seq as u8, 0xee] };
+        assert!(route(&mut tiles, &tx, asm.push(p(1, 1, true), t0)));
+        // Seq 2 is lost and never retransmitted.
+        assert!(route(&mut tiles, &tx, asm.push(p(3, 2, true), t0)));
+        assert!(route(&mut tiles, &tx, asm.evict(t0 + asm.wait())));
+        let got: Vec<(usize, bool, usize)> = rx
+            .try_iter()
+            .map(|m| match m {
+                DecoderMsg::Au { tile, au } => (tile, au.complete, au.nalus.len()),
+                DecoderMsg::Reset => panic!("unexpected reset"),
+            })
+            .collect();
+        // The decoder sees it as lost (and then waits for a keyframe).
+        assert_eq!(got, [(1, true, 1), (1, false, 0)]);
     }
 }
