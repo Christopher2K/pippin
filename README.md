@@ -79,7 +79,7 @@ When prompted interactively, `pippin` offers to save your password to the deskto
 
 | Flag | Description |
 |---|---|
-| `--dialog` | Show the connect dialog, even from a terminal or when a password is saved. Without it, the dialog appears only when there's no terminal (e.g. launched from the app menu) and something is missing. |
+| `--dialog` | Always show the GUI connect dialog, even when run from a terminal or with a saved password. |
 | `--session share\|alt` | Share the active user's screen (default), or log into a separate background session. |
 | `--scale N` | Set display scale. Defaults to `2` on HiDPI screens, `1` otherwise. |
 | `--no-auto-resize` | Keep the Mac's display resolution fixed instead of resizing with the window. |
