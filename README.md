@@ -62,11 +62,11 @@ install -Dm644 assets/pippin.svg ~/.local/share/icons/hicolor/scalable/apps/pipp
 
 ## Authentication
 
-`pippin` checks for your password in the following order:
+Unless `--dialog` is passed, `pippin` checks for your password in the following order:
 1. `--password <PASS>` or the `PIPPIN_PASSWORD` environment variable
 2. Standard input via `--password-stdin`
 3. Your desktop keyring
-4. An interactive prompt (or a GUI dialog if launched without a terminal, or with `--dialog`)
+4. An interactive terminal prompt (or the GUI connect dialog if launched from an app menu)
 
 ```sh
 # Example using pass
