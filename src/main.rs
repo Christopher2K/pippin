@@ -6,6 +6,7 @@
 //! (HEVC) mode.
 
 mod clipboard;
+mod codec;
 mod credentials;
 mod errors;
 #[cfg(test)]
@@ -25,6 +26,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 
+use codec::Codec;
 use proto::handshake::SessionMode;
 use rtp::assembler::HoldMode;
 use video::decoder::DecoderKind;
@@ -94,6 +96,11 @@ struct Cli {
     /// Send Ctrl as Command and Super as Control.
     #[arg(long)]
     swap_ctrl_cmd: bool,
+    /// Video codec: hevc (4:4:4, 4 tiles) or h264 (4:2:0, one tile). H.264
+    /// decodes in hardware on more GPUs, and the host may retransmit lost
+    /// packets for it, which helps on lossy networks.
+    #[arg(long, value_enum, default_value_t = Codec::Hevc)]
+    codec: Codec,
     /// Video decoder. auto tries CUDA, then VAAPI, then software, and falls
     /// back further if a hardware decoder can't handle the stream.
     #[arg(long, value_enum, default_value_t = DecoderKind::Auto)]
@@ -338,6 +345,7 @@ fn connect(
         user: user.to_owned(),
         password: password.clone(),
         session_mode: cli.session,
+        codec: cli.codec,
         decoder: if cli.no_hw { DecoderKind::Software } else { cli.decoder },
         vaapi_device: cli.vaapi_device.clone(),
         decode_threads: cli.decode_threads,

@@ -3,7 +3,8 @@
 //!
 //! Each offer is a binary plist wrapping a zlib-compressed protobuf
 //! "MediaBlob". The video offer requests HEVC 4:4:4 split into horizontal
-//! tiles; the audio offer must be present for the host to start streaming.
+//! tiles, or H.264 4:2:0 in one; the audio offer must be present for the
+//! host to start streaming.
 
 use std::io::Write;
 
@@ -12,16 +13,21 @@ use flate2::write::ZlibEncoder;
 use rand::RngCore;
 use rand::rngs::OsRng;
 
+use crate::codec::Codec;
+
 pub const SRTP_BLOB_LEN: usize = 46;
 pub const TILES_PER_FRAME: u64 = 4;
+/// H.264 tiles reference each other's pictures in a way one libavcodec
+/// context resolves to the wrong tile, so H.264 is asked for in one tile.
+pub const TILES_PER_FRAME_H264: u64 = 1;
 
 const MODE_VIDEO: i64 = 7;
 const MODE_AUDIO: i64 = 8;
 
 const HEVC_PARAMS: &[u8] =
     b"FLS;MS:-1;LF:-1;LTR;CABAC;POS:0;EOD:1;HTS:2;RR:3;AR:16/9,5/8;XR:16/9,5/8;";
-/// The same without the `LTR;` capability, as the reference offers with
-/// long-term references off.
+/// The same without `LTR;`: for H.264, which has no DONL to acknowledge
+/// references by, and for HEVC with long-term references off.
 const HEVC_PARAMS_NO_LTR: &[u8] = b"FLS;MS:-1;LF:-1;CABAC;POS:0;EOD:1;HTS:2;RR:3;AR:16/9,5/8;XR:16/9,5/8;";
 const AVC_PARAMS: &[u8] = b"FLS;LF:-1;POS:5;EOD:1;HTS:2;RR:3;POSE:4;AR:16/9,5/8;XR:16/9,5/8;";
 
@@ -192,7 +198,16 @@ fn endpoint_info() -> Vec<u8> {
     out
 }
 
-fn media_blob(mode: i64, session_id: u32, audio: bool, ltr: bool) -> Vec<u8> {
+/// Tiles the offer asks for (`tilesPerFrame`, which the host honours).
+pub fn tiles_per_frame(codec: Codec) -> u64 {
+    match codec {
+        Codec::Hevc => TILES_PER_FRAME,
+        Codec::H264 => TILES_PER_FRAME_H264,
+    }
+}
+
+/// `ltr` asks for long-term references; never with H.264.
+fn media_blob(mode: i64, session_id: u32, audio: bool, codec: Codec, ltr: bool) -> Vec<u8> {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
@@ -200,9 +215,12 @@ fn media_blob(mode: i64, session_id: u32, audio: bool, ltr: bool) -> Vec<u8> {
     let desc = if mode == MODE_VIDEO {
         let entry = |alt: u64| Pb::default().int(1, 1).int(2, alt).int(3, 50115).int(4, 0).0;
         let (e, ea) = (entry(1), entry(2));
+        let h264 = codec == Codec::H264;
+        let ltr = ltr && !h264;
         // Counter-intuitively, the bank tagged 100 is the one the host
-        // answers with HEVC 4:4:4 and 123 yields H.264; offering both lets
-        // the host pick HEVC.
+        // answers with HEVC 4:4:4 and 123 yields H.264 (carrying the
+        // HEVC-looking parameters); offering both lets the host pick HEVC.
+        // H.264 is had by offering 123 alone, without long-term references.
         let bank_123 = Pb::default()
             .int(1, 123)
             .bytes(2, &e)
@@ -214,15 +232,18 @@ fn media_blob(mode: i64, session_id: u32, audio: bool, ltr: bool) -> Vec<u8> {
             .0;
         let bank_100 =
             Pb::default().int(1, 100).bytes(2, &e).bytes(2, &ea).bytes(3, AVC_PARAMS).int(4, 14).0;
-        // Field 2 is allowRTCPFB and 7 ltrpEnabled. The reference clears
-        // both with LTR off; we keep RTCP feedback allowed so NACKs and
-        // keyframe requests are unaffected and only LTR varies.
-        let d = Pb::default()
+        // Field 2 is allowRTCPFB and 7 ltrpEnabled. H.264 clears both, as
+        // the reference does. HEVC with LTR off keeps RTCP feedback allowed
+        // so NACKs and keyframe requests are unaffected and only LTR varies.
+        let mut d = Pb::default()
             .int(1, session_id as u64)
-            .int(2, 1)
-            .bytes(3, &bank_123)
-            .bytes(3, &bank_100)
-            .int(6, TILES_PER_FRAME)
+            .int(2, !h264 as u64)
+            .bytes(3, &bank_123);
+        if !h264 {
+            d = d.bytes(3, &bank_100);
+        }
+        let d = d
+            .int(6, tiles_per_frame(codec))
             .int(7, ltr as u64)
             .int(8, 63)
             .int(9, 1)
@@ -269,13 +290,13 @@ fn zlib(data: &[u8]) -> Vec<u8> {
     e.finish().expect("in-memory zlib")
 }
 
-fn offer_plist(mode: i64, session_id: u32, audio: bool, ltr: bool) -> Vec<u8> {
+fn offer_plist(mode: i64, session_id: u32, audio: bool, codec: Codec, ltr: bool) -> Vec<u8> {
     let mut dict = plist::Dictionary::new();
     dict.insert("avcMediaStreamOptionRemoteEndpointInfo".into(), plist::Value::Data(endpoint_info()));
     dict.insert("avcMediaStreamNegotiatorMode".into(), plist::Value::Integer(mode.into()));
     dict.insert(
         "avcMediaStreamNegotiatorMediaBlob".into(),
-        plist::Value::Data(zlib(&media_blob(mode, session_id, audio, ltr))),
+        plist::Value::Data(zlib(&media_blob(mode, session_id, audio, codec, ltr))),
     );
     dict.insert(
         "avcMediaStreamOptionCallID".into(),
@@ -296,6 +317,7 @@ pub struct MediaOffer {
     pub video_ssrc: u32,
     pub audio_ssrc: u32,
     alt_session: bool,
+    codec: Codec,
     opts: OfferOptions,
     video_offer: Vec<u8>,
     audio_offer: Vec<u8>,
@@ -303,8 +325,9 @@ pub struct MediaOffer {
 
 impl MediaOffer {
     /// `alt_session` drops the second-stream 60 fps bit, as the native
-    /// viewer does for a separate login session.
-    pub fn generate(audio: bool, alt_session: bool, opts: OfferOptions) -> Self {
+    /// viewer does for a separate login session. `codec` is the video codec
+    /// to ask for (the audio offer doesn't depend on it).
+    pub fn generate(audio: bool, alt_session: bool, codec: Codec, opts: OfferOptions) -> Self {
         let key = || {
             let mut k = [0u8; SRTP_BLOB_LEN];
             OsRng.fill_bytes(&mut k);
@@ -321,9 +344,10 @@ impl MediaOffer {
             video_ssrc,
             audio_ssrc,
             alt_session,
+            codec,
             opts,
-            video_offer: offer_plist(MODE_VIDEO, video_ssrc, false, opts.ltr),
-            audio_offer: offer_plist(MODE_AUDIO, audio_ssrc, audio, false),
+            video_offer: offer_plist(MODE_VIDEO, video_ssrc, false, codec, opts.ltr),
+            audio_offer: offer_plist(MODE_AUDIO, audio_ssrc, audio, codec, false),
         }
     }
 
@@ -331,7 +355,7 @@ impl MediaOffer {
     /// the keys and SSRCs, so a mid-session re-offer can renegotiate it.
     pub fn set_options(&mut self, opts: OfferOptions) {
         if opts.ltr != self.opts.ltr {
-            self.video_offer = offer_plist(MODE_VIDEO, self.video_ssrc, false, opts.ltr);
+            self.video_offer = offer_plist(MODE_VIDEO, self.video_ssrc, false, self.codec, opts.ltr);
         }
         self.opts = opts;
     }
@@ -455,7 +479,7 @@ mod tests {
 
     #[test]
     fn message_layout() {
-        let offer = MediaOffer::generate(false, false, OfferOptions::default());
+        let offer = MediaOffer::generate(false, false, Codec::Hevc, OfferOptions::default());
         let m = offer.message();
         let a = u16::from_be_bytes([m[10], m[11]]) as usize;
         let v = u16::from_be_bytes([m[12], m[13]]) as usize;
@@ -483,7 +507,7 @@ mod tests {
 
     #[test]
     fn video_ssrc_is_in_blob() {
-        let blob = media_blob(MODE_VIDEO, 0xDEADBEEF, false, true);
+        let blob = media_blob(MODE_VIDEO, 0xDEADBEEF, false, Codec::Hevc, true);
         let (_, desc) = PbReader::new(&blob).find(|(f, _)| *f == 5).unwrap();
         let PbValue::Bytes(desc) = desc else { panic!() };
         let (f, v) = PbReader::new(desc).next().unwrap();
@@ -498,14 +522,14 @@ mod tests {
         assert_eq!(stream_flags(true, fps(true)), 5);
         assert_eq!(stream_flags(false, fps(false)), 4);
         assert_eq!(stream_flags(true, fps(false)), 4);
-        let mut offer = MediaOffer::generate(false, false, OfferOptions::default());
+        let mut offer = MediaOffer::generate(false, false, Codec::Hevc, OfferOptions::default());
         let keys = (offer.video_key_s, offer.video_ssrc);
         offer.set_options(fps(false));
         let m = offer.message();
         assert_eq!(&m[6..10], &[0, 0, 0, 4]);
         // A re-offer keeps the keys and SSRCs.
         assert_eq!((offer.video_key_s, offer.video_ssrc), keys);
-        let alt = MediaOffer::generate(false, true, OfferOptions::default());
+        let alt = MediaOffer::generate(false, true, Codec::Hevc, OfferOptions::default());
         assert_eq!(&alt.message()[6..10], &[0, 0, 0, 5]);
     }
 
@@ -522,7 +546,7 @@ mod tests {
     #[test]
     fn ltr_option_in_video_offer() {
         for ltr in [true, false] {
-            let mut offer = MediaOffer::generate(false, false, OfferOptions::default());
+            let mut offer = MediaOffer::generate(false, false, Codec::Hevc, OfferOptions::default());
             offer.set_options(OfferOptions { ltr, ..Default::default() });
             let desc = video_desc(&offer.video_offer);
             let f7 = PbReader::new(&desc).find_map(|(f, v)| match (f, v) {
@@ -534,5 +558,50 @@ mod tests {
             // RTCP feedback stays allowed either way.
             assert!(PbReader::new(&desc).any(|(f, v)| f == 2 && matches!(v, PbValue::Int(1))));
         }
+    }
+
+    /// The video description (MediaBlob field 5) of iShareScreen's
+    /// `_build_mediablob(7, ...)`, written out by hand from offers.py: the
+    /// default offer for HEVC, and ISS_VIDEO_CODEC=avc for H.264.
+    #[test]
+    fn video_description_per_codec() {
+        fn field(tag: u8, body: &[u8]) -> Vec<u8> {
+            let mut v = vec![tag, body.len() as u8];
+            v.extend_from_slice(body);
+            v
+        }
+        let res = field(0x12, &[0x08, 1, 0x10, 1, 0x18, 0xc3, 0x87, 3, 0x20, 0]);
+        let res_alt = field(0x12, &[0x08, 1, 0x10, 2, 0x18, 0xc3, 0x87, 3, 0x20, 0]);
+        let bank_123 = |params: &[u8]| {
+            let mut b = vec![0x08, 123];
+            for r in [&res, &res_alt, &res, &res_alt] {
+                b.extend_from_slice(r);
+            }
+            b.extend(field(0x1a, params));
+            b.extend_from_slice(&[0x20, 1]);
+            field(0x1a, &b)
+        };
+        let mut bank_100 = vec![0x08, 100];
+        bank_100.extend(res.iter().chain(&res_alt));
+        bank_100.extend(field(0x1a, b"FLS;LF:-1;POS:5;EOD:1;HTS:2;RR:3;POSE:4;AR:16/9,5/8;XR:16/9,5/8;"));
+        bank_100.extend_from_slice(&[0x20, 14]);
+        let tail = |tiles: u8, ltrp: u8| vec![0x30, tiles, 0x38, ltrp, 0x40, 63, 0x48, 1, 0x60, 1];
+
+        let mut hevc = vec![0x08, 5, 0x10, 1];
+        hevc.extend(bank_123(b"FLS;MS:-1;LF:-1;LTR;CABAC;POS:0;EOD:1;HTS:2;RR:3;AR:16/9,5/8;XR:16/9,5/8;"));
+        hevc.extend(field(0x1a, &bank_100));
+        hevc.extend(tail(4, 1));
+        let mut h264 = vec![0x08, 5, 0x10, 0];
+        h264.extend(bank_123(b"FLS;MS:-1;LF:-1;CABAC;POS:0;EOD:1;HTS:2;RR:3;AR:16/9,5/8;XR:16/9,5/8;"));
+        h264.extend(tail(1, 0));
+
+        for (codec, want) in [(Codec::Hevc, hevc), (Codec::H264, h264)] {
+            // LTR asked for: H.264 drops it regardless.
+            let blob = media_blob(MODE_VIDEO, 5, false, codec, true);
+            let (_, desc) = PbReader::new(&blob).find(|(f, _)| *f == 5).unwrap();
+            let PbValue::Bytes(desc) = desc else { panic!() };
+            assert_eq!(desc, &want[..], "{codec}");
+        }
+        assert_eq!(tiles_per_frame(Codec::H264), 1);
     }
 }

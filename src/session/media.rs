@@ -1,4 +1,5 @@
-//! UDP media threads: SRTP video receive, HEVC decode and RTCP feedback.
+//! UDP media threads: SRTP video receive, HEVC/H.264 decode and RTCP
+//! feedback.
 
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap};
@@ -15,7 +16,8 @@ use crate::proto::offers::{MediaOffer, SRTP_BLOB_LEN};
 use crate::rtp::assembler::{AccessUnit, Assembler, HoldStats, POLL_EVERY, TileMap};
 use crate::rtp::srtp::{SrtcpReceiver, SrtcpSender, SrtpReceiver, SrtpSender};
 use crate::rtp::stats::{ReceiverStats, VIDEO_CLOCK_HZ};
-use crate::rtp::{hevc, rtcp};
+use crate::codec::Codec;
+use crate::rtp::{h264, hevc, rtcp};
 use crate::video::decoder::{self, Decoder, DecoderOptions, Picture};
 
 /// Why a keyframe was requested, so the metrics can keep loss recovery
@@ -263,8 +265,9 @@ impl LossStats {
                 None => "unknown".into(),
             };
             tracing::debug!(
-                "loss: {} NACKed, {} retried; holds {} started, {} filled ({damaged} pictures damaged after), \
+                "loss ({}): {} NACKed, {} retried; holds {} started, {} filled ({damaged} pictures damaged after), \
                  {} given up; DONL backwards {}; rtt {rtt}, hold {} ms{}",
+                asm.codec(),
                 self.nacked,
                 self.retried,
                 holds.started,
@@ -284,12 +287,13 @@ pub(super) fn video_rx(
     shared: Arc<Shared>,
     sock: UdpSocket,
     key: [u8; SRTP_BLOB_LEN],
+    codec: Codec,
     dec: Sender<DecoderMsg>,
     fb: Sender<Feedback>,
 ) {
     let mut srtp = SrtpReceiver::new(&key);
     let srtcp = SrtcpReceiver::new(&key);
-    let mut asm = Assembler::default();
+    let mut asm = Assembler::new(codec);
     let mut tiles = TileMap::default();
     let mut next_seq: HashMap<u32, u16> = HashMap::new();
     // NACKed packets not yet seen: when first requested, and whether retried.
@@ -471,29 +475,56 @@ pub(super) fn ctrl_rx(shared: Arc<Shared>, sock: UdpSocket, key: [u8; SRTP_BLOB_
 }
 
 /// Parameter sets seen in the stream, prepended to every IRAP so the
-/// decoder can (re)start from any keyframe.
-#[derive(Default)]
+/// decoder can (re)start from any keyframe. H.264 has no VPS; its SPS and
+/// PPS come from the host's avcC packet (see [`h264`]).
 struct ParamSets {
+    codec: Codec,
     vps: Option<Vec<u8>>,
     sps: Option<Vec<u8>>,
     pps: BTreeMap<u32, Vec<u8>>,
 }
 
 impl ParamSets {
-    fn absorb(&mut self, nal: &[u8]) {
-        match hevc::nal_type(nal) {
-            hevc::NAL_VPS => self.vps = Some(nal.to_vec()),
-            hevc::NAL_SPS => self.sps = Some(nal.to_vec()),
-            hevc::NAL_PPS => {
-                if let Some((tiles, wpp)) = hevc::pps_parallelism(nal) {
-                    tracing::debug!("PPS: tiles={tiles} wavefront={wpp}");
+    fn new(codec: Codec) -> Self {
+        Self { codec, vps: None, sps: None, pps: BTreeMap::new() }
+    }
+
+    /// Returns true if `nal` is an SPS different from the one held.
+    fn absorb(&mut self, nal: &[u8]) -> bool {
+        let sps = match self.codec {
+            Codec::Hevc => match hevc::nal_type(nal) {
+                hevc::NAL_VPS => {
+                    self.vps = Some(nal.to_vec());
+                    None
                 }
-                if let Some(id) = hevc::pps_id(nal) {
-                    self.pps.insert(id, nal.to_vec());
+                hevc::NAL_SPS => Some(nal.to_vec()),
+                hevc::NAL_PPS => {
+                    if let Some((tiles, wpp)) = hevc::pps_parallelism(nal) {
+                        tracing::debug!("PPS: tiles={tiles} wavefront={wpp}");
+                    }
+                    if let Some(id) = hevc::pps_id(nal) {
+                        self.pps.insert(id, nal.to_vec());
+                    }
+                    None
                 }
-            }
-            _ => {}
+                _ => None,
+            },
+            Codec::H264 => match h264::nal_type(nal) {
+                h264::NAL_SPS => Some(h264::patch_sps_dpb(nal)),
+                h264::NAL_PPS => {
+                    if let Some(id) = h264::pps_id(nal) {
+                        self.pps.insert(id, nal.to_vec());
+                    }
+                    None
+                }
+                _ => None,
+            },
+        };
+        let changed = sps.is_some() && sps != self.sps;
+        if sps.is_some() {
+            self.sps = sps;
         }
+        changed
     }
 
     fn write(&self, out: &mut Vec<u8>) {
@@ -518,15 +549,31 @@ const HW_GRACE_AUS: u32 = 120;
 const TILE_GATHER: Duration = Duration::from_millis(4);
 /// Never hold a picture longer than this, even under a steady stream.
 const TILE_GATHER_MAX: Duration = Duration::from_millis(25);
+/// An H.264 SPS that changed this recently before a geometry change is
+/// taken to be the new geometry's (the avcC raced ahead of the layout).
+const CONFIG_RECENT: Duration = Duration::from_millis(1000);
+/// How long H.264 decoding pauses after a geometry change for the new
+/// geometry's avcC before carrying on with what it has.
+const CONFIG_WAIT: Duration = Duration::from_millis(2000);
 
 struct DecodeLoop {
     shared: Arc<Shared>,
+    codec: Codec,
     opts: DecoderOptions,
     fb: Sender<Feedback>,
     decoder: Decoder,
     params: ParamSets,
     /// SPS the decoder was last started with.
     active_sps: Option<Vec<u8>>,
+    /// When the stream last brought a new SPS.
+    sps_changed: Option<Instant>,
+    /// The `geometry_changed` stamp last acted on.
+    geometry_seen: u64,
+    /// H.264 after a geometry change: the SPS then held, and since when.
+    /// Nothing is decoded until a different one arrives, since the host
+    /// sends the new geometry's in an avcC packet, not in band, and slices
+    /// of the new size must not be decoded with the old one.
+    config_wait: Option<(Option<Vec<u8>>, Instant)>,
     /// Decoder-wide, not per tile: the tiles are one coded sequence in one
     /// DPB, fed in cross-SSRC decode order, and a P picture on one tile
     /// references pictures of the others. IDRs come only on the base tile
@@ -693,9 +740,42 @@ impl DecodeLoop {
         self.fed_without_output = self.decoder.backend().is_hw().then_some(0);
     }
 
+    /// H.264 only: holds decoding after a geometry change until the new
+    /// geometry's SPS arrives. True while it is held.
+    fn wait_for_config(&mut self, irap: bool) -> bool {
+        let stamp = self.shared.geometry_changed.load(Ordering::Relaxed);
+        if stamp != self.geometry_seen {
+            self.geometry_seen = stamp;
+            if self.sps_changed.is_none_or(|t| t.elapsed() >= CONFIG_RECENT) {
+                tracing::debug!("geometry changed; waiting for the new H.264 configuration");
+                self.config_wait = Some((self.params.sps.clone(), Instant::now()));
+                self.awaiting_idr = true;
+            }
+        }
+        let Some((old, since)) = &self.config_wait else { return false };
+        if *old != self.params.sps {
+            tracing::info!("new H.264 configuration after {} ms", since.elapsed().as_millis());
+        } else if since.elapsed() >= CONFIG_WAIT {
+            tracing::warn!("no new H.264 configuration {} ms after a geometry change", since.elapsed().as_millis());
+        } else {
+            return true;
+        }
+        self.config_wait = None;
+        if !irap {
+            let _ = self.fb.send(Feedback::Keyframe(None, KeyframeCause::Reoffer));
+        }
+        false
+    }
+
     fn access_unit(&mut self, tile: usize, au: AccessUnit) {
-        for nal in au.nalus.iter().filter(|n| hevc::is_param_set(n)) {
-            self.params.absorb(nal);
+        for nal in au.nalus.iter().filter(|n| self.codec.is_param_set(n)) {
+            if self.params.absorb(nal) {
+                self.sps_changed = Some(Instant::now());
+            }
+        }
+        let irap = au.complete && au.nalus.iter().any(|n| self.codec.is_irap(n));
+        if self.codec == Codec::H264 && self.wait_for_config(irap) {
+            return;
         }
         let conceal = self.shared.op().after_loss == AfterLoss::Conceal;
         if !conceal && self.lossy {
@@ -712,11 +792,9 @@ impl DecodeLoop {
             // Concealing: decode the slices that did arrive.
             self.lossy = true;
         }
-        if !au.nalus.iter().any(|n| hevc::is_slice(n)) {
+        if !au.nalus.iter().any(|n| self.codec.is_slice(n)) {
             return;
         }
-        // Part of a keyframe is not one: it doesn't restart the decoder.
-        let irap = au.complete && au.nalus.iter().any(|n| hevc::is_irap(n));
         let bytes: u64 = au.nalus.iter().map(|n| n.len() as u64).sum();
         let m = &self.shared.metrics;
         if irap {
@@ -747,7 +825,10 @@ impl DecodeLoop {
             self.irap_follow = follow_mask(self.shared.tiles.load(Ordering::Relaxed) as usize, tile);
             self.params.write(&mut annexb);
         }
-        for nal in au.nalus.iter().filter(|n| !(irap && hevc::is_param_set(n))) {
+        // H.264 parameter sets only ever come from `params`, so an in-band
+        // SPS can't undo the reference-count patch.
+        let drop_params = irap || self.codec == Codec::H264;
+        for nal in au.nalus.iter().filter(|n| !(drop_params && self.codec.is_param_set(n))) {
             push_annexb(&mut annexb, nal);
         }
 
@@ -763,7 +844,7 @@ impl DecodeLoop {
         let concealed_in_flight = self.origin.values().any(|o| o.4);
         self.decoder.set_lenient(self.lossy || concealed_in_flight);
         let ok = self.decoder.decode(&annexb, self.pts, &mut |p| pictures.push(p));
-        let slices = au.nalus.iter().filter(|n| hevc::is_slice(n)).count();
+        let slices = au.nalus.iter().filter(|n| self.codec.is_slice(n)).count();
         let took = started.elapsed();
         self.stats.record(slices, pictures.len(), took);
         self.shared.metrics.decoded(took);
@@ -826,7 +907,8 @@ impl DecodeLoop {
             // Repaired by the next IRAP after this picture's, not by the
             // next clean P picture (it may still reference the damage).
             self.loss_keyframe(tile, epoch, KeyframeCause::Damaged);
-        } else if let (0, Some(d)) = (tile, donl) {
+        } else if let (0, Some(d), true) = (tile, donl, self.codec.has_donl()) {
+            // H.264 has no DONL, so no long-term-reference acks either.
             let _ = self.fb.send(Feedback::LtrAck(d));
         }
         self.shared.touch(&self.shared.last_frame);
@@ -892,16 +974,21 @@ pub(super) fn decoder(shared: Arc<Shared>, rx: Receiver<DecoderMsg>, fb: Sender<
             return;
         }
     };
-    tracing::info!("video decoder: {:?}", decoder.backend());
+    let codec = opts.codec;
+    tracing::info!("video decoder: {:?} ({codec})", decoder.backend());
     shared.metrics.set_decoder(decoder.backend().name());
     let hw = decoder.backend().is_hw();
     let mut st = DecodeLoop {
         shared: shared.clone(),
+        codec,
         opts,
         fb,
         decoder,
-        params: ParamSets::default(),
+        params: ParamSets::new(codec),
         active_sps: None,
+        sps_changed: None,
+        geometry_seen: shared.geometry_changed.load(Ordering::Relaxed),
+        config_wait: None,
         awaiting_idr: true,
         pts: 0,
         origin: HashMap::new(),
@@ -932,9 +1019,13 @@ pub(super) fn decoder(shared: Arc<Shared>, rx: Receiver<DecoderMsg>, fb: Sender<
                     // A new stream: an open outage belongs to the old one,
                     // and its recovery would be the adoption's.
                     shared.metrics.end_outage();
-                    // New SSRC group: new parameter sets will follow.
-                    st.params = ParamSets::default();
+                    // New SSRC group: new parameter sets will follow, and
+                    // whatever SPS comes first is the current one.
+                    st.params = ParamSets::new(st.codec);
                     st.active_sps = None;
+                    st.sps_changed = None;
+                    st.geometry_seen = st.shared.geometry_changed.load(Ordering::Relaxed);
+                    st.config_wait = None;
                 }
                 // A stall reset keeps the outage open: the epoch carries on,
                 // so the next IRAP still ends it. It keeps the parameter

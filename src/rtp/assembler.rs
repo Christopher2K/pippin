@@ -14,8 +14,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
-use super::hevc;
 use super::srtp::RtpPacket;
+use crate::codec::Codec;
 
 /// How often the receiver should call [`Assembler::evict`] (and retry
 /// NACKs) while anything is pending.
@@ -181,14 +181,14 @@ impl Group {
         Self { packets: Vec::new(), started: now, last_at: now, first: 0, last: 0, marker: None, donl: None, held: false }
     }
 
-    fn insert(&mut self, seq: u16, marker: bool, payload: Vec<u8>, now: Instant) {
+    fn insert(&mut self, seq: u16, marker: bool, payload: Vec<u8>, now: Instant, codec: Codec) {
         let earliest = self.packets.is_empty() || seq.wrapping_sub(self.first) >= 0x8000;
         if self.packets.is_empty() || (!earliest && seq.wrapping_sub(self.last) < 0x8000) {
             self.last = seq;
         }
         if earliest {
             self.first = seq;
-            self.donl = hevc::first_donl(&[(seq, payload.as_slice())]);
+            self.donl = codec.first_donl(&[(seq, payload.as_slice())]);
         }
         if marker {
             self.marker = Some((seq, now));
@@ -211,7 +211,7 @@ impl Group {
 /// Apple numbers access units across all tiles of the coded sequence, and
 /// unlike arrival order that survives network reordering and a lost first
 /// packet (every packet, FU fragments included, carries the DONL). Equal
-/// DONLs fall back to tile order, missing ones to arrival.
+/// DONLs fall back to tile order, missing ones (H.264 has none) to arrival.
 fn before(sa: u32, a: &Group, sb: u32, b: &Group) -> bool {
     if sa == sb {
         return a.first.wrapping_sub(b.first) >= 0x8000;
@@ -229,15 +229,16 @@ fn before(sa: u32, a: &Group, sb: u32, b: &Group) -> bool {
 /// before it are kept if present; if they were lost the decoder uses the
 /// ones it has, which mid-stream on one SSRC are current (a parameter
 /// change comes with a new SSRC group, where nothing precedes the IRAP).
-fn whole_irap(payloads: &[(u16, &[u8])]) -> bool {
+fn whole_irap(codec: Codec, payloads: &[(u16, &[u8])]) -> bool {
     let Some((_, p)) = payloads.first() else { return false };
-    if p.len() >= 3 && hevc::nal_type(p) == hevc::NAL_FU && p[2] & 0x80 == 0 {
+    if codec.continues_nal(p) {
         return false;
     }
-    hevc::depayload(payloads)
+    codec
+        .depayload(payloads)
         .iter()
-        .find(|n| hevc::is_slice(n))
-        .is_some_and(|n| hevc::is_irap(n) && n.len() > 2 && n[2] & 0x80 != 0)
+        .find(|n| codec.is_slice(n))
+        .is_some_and(|n| codec.is_irap(n) && codec.first_in_picture(n))
 }
 
 /// What to do with the first pending group in decode order.
@@ -256,6 +257,7 @@ enum Verdict {
 /// keyframe anyway. Their extra latency is bounded by the hold. SSRCs not
 /// adopted are ordered on their own and never block the tiles.
 pub struct Assembler {
+    codec: Codec,
     groups: HashMap<(u32, u32), Group>,
     flushed: HashMap<(u32, u32), Instant>,
     last_marker: HashMap<u32, u16>,
@@ -273,6 +275,7 @@ pub struct Assembler {
 impl Default for Assembler {
     fn default() -> Self {
         Self {
+            codec: Codec::default(),
             groups: HashMap::new(),
             flushed: HashMap::new(),
             last_marker: HashMap::new(),
@@ -287,6 +290,14 @@ impl Default for Assembler {
 }
 
 impl Assembler {
+    pub fn new(codec: Codec) -> Self {
+        Self { codec, ..Default::default() }
+    }
+
+    pub fn codec(&self) -> Codec {
+        self.codec
+    }
+
     /// Orders these SSRCs' access units together (the adopted tiles).
     pub fn link(&mut self, ssrcs: &[u32]) {
         self.linked = ssrcs.iter().copied().collect();
@@ -357,7 +368,7 @@ impl Assembler {
         if g.packets.iter().any(|p| p.0 == pkt.seq) {
             return Vec::new();
         }
-        g.insert(pkt.seq, pkt.marker, pkt.payload, now);
+        g.insert(pkt.seq, pkt.marker, pkt.payload, now, self.codec);
         let mut out = Vec::new();
         // Only a group with its marker can complete; time-based give-ups
         // happen in evict().
@@ -434,7 +445,7 @@ impl Assembler {
         // An IRAP resets the shared DPB, so whatever came before it no
         // longer matters, as long as the access unit itself is whole from
         // its first slice.
-        if contiguous && (starts_after_prev || whole_irap(&g.payloads())) {
+        if contiguous && (starts_after_prev || whole_irap(self.codec, &g.payloads())) {
             Verdict::Emit { complete: true }
         } else if !self.hold.holding() || now >= marker_at + self.wait() {
             Verdict::Emit { complete: false }
@@ -484,8 +495,8 @@ impl Assembler {
             }
         }
         let refs = g.payloads();
-        let nalus = hevc::depayload(&refs);
-        let donl = hevc::first_donl(&refs);
+        let nalus = self.codec.depayload(&refs);
+        let donl = self.codec.first_donl(&refs);
         if complete
             && self.linked.contains(&key.0)
             && let Some(d) = donl
@@ -608,6 +619,7 @@ impl TileMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rtp::{h264, hevc};
 
     fn pkt(ssrc: u32, seq: u16, ts: u32, marker: bool, payload: Vec<u8>) -> RtpPacket {
         RtpPacket { ssrc, seq, ts, marker, pt: 100, payload }
@@ -919,6 +931,79 @@ mod tests {
         assert_eq!(a.wait(), Duration::from_millis(225));
         a.set_rtt(Duration::from_millis(200));
         assert_eq!(a.wait(), Duration::from_millis(300));
+    }
+
+    /// An H.264 FU-A fragment of a type-1 slice: an I slice that begins
+    /// its picture, an I slice that doesn't, or a P slice.
+    fn h264_fu(flags: u8, kind: &str) -> Vec<u8> {
+        // first_mb_in_slice and slice_type: 0 and 7, 3 and 7, or 0 and 5.
+        let header: &[u8] = match kind {
+            "I" => &[0b1000_1000],
+            "I-later" => &[0b0010_0000, 0b1000_0000],
+            _ => &[0b1001_1000],
+        };
+        let mut v = vec![0x60 | h264::NAL_FU_A, flags | 1];
+        v.extend_from_slice(header);
+        v.push(0xcc);
+        v
+    }
+
+    /// Apple's 0x92 decoder configuration with a stand-in SPS and PPS.
+    fn h264_config() -> Vec<u8> {
+        let mut p = vec![h264::CONFIG_MARKER];
+        p.extend_from_slice(b"avc1....avcC");
+        p.extend_from_slice(&[1, 0x64, 0, 0x1f, 0xff, 0xe1, 0, 2, 0x67, 0x64, 1, 0, 2, 0x68, 0xeb]);
+        p
+    }
+
+    #[test]
+    fn h264_hold_fills_from_retransmission() {
+        let t0 = Instant::now();
+        let mut a = Assembler::new(Codec::H264);
+        a.link(&[20]);
+        let au = one(a.push(pkt(20, 1, 1, true, vec![0x65, 0x88, 0x84]), t0));
+        assert!(au.complete && au.donl.is_none());
+        // A P slice in three fragments; the middle one is lost, then resent.
+        assert!(a.push(pkt(20, 2, 2, false, h264_fu(0x80, "P")), t0).is_empty());
+        assert!(a.push(pkt(20, 4, 2, true, h264_fu(0x40, "P")), t0).is_empty());
+        assert!(a.evict(t0 + a.wait() / 2).is_empty());
+        let au = one(a.push(pkt(20, 3, 2, false, h264_fu(0, "P")), t0 + Duration::from_millis(10)));
+        assert!(au.complete && au.recovered && au.donl.is_none());
+        assert_eq!(au.nalus, vec![vec![0x61, 0b1001_1000, 0xcc, 0b1001_1000, 0xcc, 0b1001_1000, 0xcc]]);
+        let s = a.take_stats();
+        assert_eq!((s.started, s.filled, s.given_up, s.donl_backwards), (1, 1, 0, 0));
+
+        // Given up: only the parameter sets from the config packet survive.
+        assert!(a.push(pkt(20, 5, 3, false, h264_config()), t0).is_empty());
+        assert!(a.push(pkt(20, 7, 3, true, h264_fu(0x40, "P")), t0).is_empty());
+        let au = one(a.evict(t0 + a.wait()));
+        assert!(!au.complete);
+        assert_eq!(au.nalus, vec![vec![0x67, 0x64], vec![0x68, 0xeb]]);
+    }
+
+    #[test]
+    fn h264_keyframe_after_lost_tail() {
+        for (kind, config, whole) in [("I", false, true), ("I", true, true), ("I-later", false, false), ("P", false, false)] {
+            let t0 = Instant::now();
+            let mut a = Assembler::new(Codec::H264);
+            assert!(one(a.push(pkt(9, 9, 0, true, h264_fu(0xc0, "P")), t0)).complete);
+            // Seq 11, this AU's tail and marker, is lost.
+            assert!(a.push(pkt(9, 10, 1, false, h264_fu(0x80, "P")), t0).is_empty());
+            let mut seq = 12;
+            if config {
+                assert!(a.push(pkt(9, seq, 2, false, h264_config()), t0).is_empty());
+                seq += 1;
+            }
+            assert!(a.push(pkt(9, seq, 2, false, h264_fu(0x80, kind)), t0).is_empty());
+            assert!(a.push(pkt(9, seq + 1, 2, true, h264_fu(0x40, kind)), t0).is_empty());
+            let aus = a.evict(t0 + a.wait());
+            // An intra picture whole from its first slice needs nothing
+            // before it.
+            assert_eq!(order(&aus), vec![(9, false), (9, whole)], "{kind} config={config}");
+            if whole {
+                assert_eq!(aus[1].nalus.len(), 1 + 2 * config as usize);
+            }
+        }
     }
 
     #[test]
