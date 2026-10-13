@@ -14,7 +14,7 @@ use crate::proto::offers::{MediaOffer, SRTP_BLOB_LEN};
 use crate::rtp::assembler::{AccessUnit, Assembler, TileMap};
 use crate::rtp::srtp::{SrtcpReceiver, SrtcpSender, SrtpReceiver, SrtpSender};
 use crate::rtp::{hevc, rtcp};
-use crate::video::decoder::{Backend, Decoder, DecoderOptions, Picture};
+use crate::video::decoder::{Decoder, DecoderOptions, Picture};
 
 /// Requests from the media threads to the feedback sender.
 pub enum Feedback {
@@ -231,9 +231,10 @@ fn push_annexb(out: &mut Vec<u8>, nal: &[u8]) {
     out.extend_from_slice(nal);
 }
 
-/// CUDA sometimes accepts packets but never returns pictures (e.g. 4:4:4
-/// on GPUs without support); give up on it after this many access units.
-const CUDA_GRACE_AUS: u32 = 120;
+/// A hardware decoder sometimes accepts packets but never returns pictures
+/// (e.g. 4:4:4 on GPUs without support); give up on it after this many
+/// access units.
+const HW_GRACE_AUS: u32 = 120;
 /// The host sends a frame's changed tiles back to back. Decoded pictures are
 /// held until input has been idle this long, so siblings still on the wire
 /// or in the decoder land in the same presented frame.
@@ -372,14 +373,24 @@ impl DecodeStats {
 }
 
 impl DecodeLoop {
-    fn restart(&mut self, backend: Backend) {
-        match Decoder::new(DecoderOptions { prefer_hw: backend == Backend::Cuda, ..self.opts }) {
-            Ok(d) => self.decoder = d,
+    /// Reopens the decoder on the current backend, or on the ones after it
+    /// when `next` is set (the current one can't handle the stream).
+    fn restart(&mut self, next: bool) {
+        let all = self.opts.candidates();
+        let cur = all.iter().position(|&b| b == self.decoder.backend()).unwrap_or(0);
+        let from = (cur + next as usize).min(all.len() - 1);
+        match Decoder::open_first(&all[from..], &self.opts) {
+            Ok(d) => {
+                if d.backend() != self.decoder.backend() {
+                    tracing::info!("video decoder: {:?}", d.backend());
+                }
+                self.decoder = d;
+            }
             Err(e) => tracing::error!("restarting decoder: {e:#}"),
         }
         self.awaiting_idr = true;
         self.origin.clear();
-        self.fed_without_output = (self.decoder.backend() == Backend::Cuda).then_some(0);
+        self.fed_without_output = self.decoder.backend().is_hw().then_some(0);
     }
 
     fn access_unit(&mut self, tile: usize, au: AccessUnit) {
@@ -407,7 +418,7 @@ impl DecodeLoop {
             }
             if self.active_sps.is_some() && self.active_sps != self.params.sps {
                 tracing::info!("stream parameters changed; restarting decoder");
-                self.restart(self.decoder.backend());
+                self.restart(false);
             }
             self.active_sps = self.params.sps.clone();
             self.awaiting_idr = false;
@@ -437,17 +448,19 @@ impl DecodeLoop {
         if let Some(n) = self.fed_without_output.as_mut() {
             if pictures.is_empty() {
                 *n += 1;
-                if *n >= CUDA_GRACE_AUS {
-                    tracing::warn!("CUDA decoder produced no pictures; switching to software decoding");
-                    self.restart(Backend::Software);
-                    let _ = self.fb.send(Feedback::Keyframe(None));
-                }
             } else {
                 self.fed_without_output = None;
             }
         }
         for p in pictures {
             self.publish(p);
+        }
+        let silent = self.fed_without_output.is_some_and(|n| n >= HW_GRACE_AUS);
+        if silent || self.decoder.broken() {
+            let why = if silent { "produced no pictures" } else { "can't show this stream" };
+            tracing::warn!("{:?} decoder {why}; falling back", self.decoder.backend());
+            self.restart(true);
+            let _ = self.fb.send(Feedback::Keyframe(None));
         }
     }
 
@@ -498,7 +511,7 @@ impl DecodeLoop {
 }
 
 pub(super) fn decoder(shared: Arc<Shared>, rx: Receiver<DecoderMsg>, fb: Sender<Feedback>, opts: DecoderOptions, sync_tiles: bool) {
-    let decoder = match Decoder::new(opts) {
+    let decoder = match Decoder::new(&opts) {
         Ok(d) => d,
         Err(e) => {
             shared.sink.emit(Event::Closed(Some(format!("video decoder: {e:#}"))));
@@ -506,7 +519,7 @@ pub(super) fn decoder(shared: Arc<Shared>, rx: Receiver<DecoderMsg>, fb: Sender<
         }
     };
     tracing::info!("video decoder: {:?}", decoder.backend());
-    let cuda = decoder.backend() == Backend::Cuda;
+    let hw = decoder.backend().is_hw();
     let mut st = DecodeLoop {
         shared: shared.clone(),
         opts,
@@ -517,7 +530,7 @@ pub(super) fn decoder(shared: Arc<Shared>, rx: Receiver<DecoderMsg>, fb: Sender<
         awaiting_idr: true,
         pts: 0,
         origin: HashMap::new(),
-        fed_without_output: cuda.then_some(0),
+        fed_without_output: hw.then_some(0),
         batch: Vec::new(),
         sync_tiles,
         batch_started: None,
@@ -541,7 +554,7 @@ pub(super) fn decoder(shared: Arc<Shared>, rx: Receiver<DecoderMsg>, fb: Sender<
                 // New SSRC group: new parameter sets will follow.
                 st.params = ParamSets::default();
                 st.active_sps = None;
-                st.restart(st.decoder.backend());
+                st.restart(false);
             }
             Err(RecvTimeoutError::Timeout) => st.flush(Flush::Idle),
             Err(RecvTimeoutError::Disconnected) => return,

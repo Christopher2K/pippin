@@ -25,6 +25,7 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 
 use proto::handshake::SessionMode;
+use video::decoder::DecoderKind;
 
 #[derive(Parser)]
 #[command(version, about = "Connect to a Mac's built-in Screen Sharing in high-performance mode")]
@@ -78,9 +79,17 @@ struct Cli {
     /// Send Ctrl as Command and Super as Control.
     #[arg(long)]
     swap_ctrl_cmd: bool,
-    /// Decode on the CPU even if CUDA is available.
+    /// Video decoder. auto tries CUDA, then VAAPI, then software, and falls
+    /// back further if a hardware decoder can't handle the stream.
+    #[arg(long, value_enum, default_value_t = DecoderKind::Auto)]
+    decoder: DecoderKind,
+    /// Same as --decoder software.
     #[arg(long)]
     no_hw: bool,
+    /// DRM render node for VAAPI decoding, e.g. /dev/dri/renderD129.
+    /// Default: FFmpeg's choice.
+    #[arg(long, env = "MACSHARE_VAAPI_DEVICE")]
+    vaapi_device: Option<String>,
     /// Software decode threads. Pictures are split by CTU row (wavefront),
     /// so more threads add no latency; gains level off around 4-5.
     #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u32).range(1..=16))]
@@ -313,7 +322,8 @@ fn connect(
         user: user.to_owned(),
         password: password.clone(),
         session_mode: cli.session,
-        hardware_decode: !cli.no_hw,
+        decoder: if cli.no_hw { DecoderKind::Software } else { cli.decoder },
+        vaapi_device: cli.vaapi_device.clone(),
         decode_threads: cli.decode_threads,
         sync_tiles: cli.sync_tiles,
         warmup: !cli.no_warmup,
