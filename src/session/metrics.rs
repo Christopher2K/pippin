@@ -12,7 +12,8 @@
 //!   `render_scale`, `fps` (what was offered; 60 or 30), `recovery`
 //!   (fir, pli or fir+pli), `hold` (the mode: auto, on, off), `holding`
 //!   (whether access units with gaps are held right now; auto can switch
-//!   it off), `ltr` (LTR offered and acked).
+//!   it off), `ltr` (LTR offered and acked), `after_loss` (idr: drop
+//!   pictures until the next keyframe; conceal: keep decoding).
 //! * What the host settled on: `canvas` (`[width, height]` of the encoded
 //!   canvas, from its answer or the latest display layout; null before
 //!   either), `answer_ltrp` (ltrpEnabled in the host's latest answer; null
@@ -70,6 +71,13 @@
 //!   tile received packets in the last 100 ms but produced no picture for
 //!   100 ms. A static screen, where the host sends nothing, is not frozen.
 //!   It measures the decode side; a slow renderer doesn't show here.
+//!   With `after_loss` conceal the decoder doesn't wait for the keyframe,
+//!   so the picture keeps moving: that time is `concealed_ms` instead.
+//! * `concealed_pictures`: pictures decoded after a loss and before the
+//!   next keyframe (only with `after_loss` conceal); `concealed_ms`: time
+//!   in the interval, sampled like `frozen_ms` and never counted in both,
+//!   during which the latest picture shown was such a picture and video
+//!   arrived in the last 1.5 s.
 //! * `decode_aus`, `decode_avg_ms`, `decode_worst_ms`: access units fed to
 //!   the decoder and how long the decode call took.
 //! * `presented_fps`: frames handed to the renderer (a frame is one tile
@@ -130,6 +138,9 @@ pub(super) struct Metrics {
     pub decode_worst_ns: AtomicU64,
     pub presented: AtomicU64,
     pub awaiting_idr: AtomicBool,
+    concealed_pictures: AtomicU64,
+    /// The latest picture published was concealed.
+    concealing: AtomicBool,
     /// ltrpEnabled in the latest answer: 0 unknown, 1 off, 2 on.
     answer_ltrp: AtomicU8,
     /// Session clock (ms) of each tile's latest packet and picture.
@@ -242,6 +253,21 @@ impl Metrics {
         self.recovery.lock().picture(epoch, at);
     }
 
+    /// A picture was published; `concealed` if decoded after a loss and
+    /// before the next keyframe.
+    pub fn shown(&self, concealed: bool) {
+        if concealed {
+            self.concealed_pictures.fetch_add(1, Ordering::Relaxed);
+        }
+        self.concealing.store(concealed, Ordering::Relaxed);
+    }
+
+    /// Whether the picture counts as concealed at `now_ms`; only asked
+    /// when it isn't frozen.
+    fn concealed(&self, now_ms: u64, last_video_ms: u64) -> bool {
+        last_video_ms != 0 && now_ms.saturating_sub(last_video_ms) < FLOWING_MS && self.concealing.load(Ordering::Relaxed)
+    }
+
     /// Whether the picture counts as frozen at `now_ms` (see the module
     /// docs), given the session clock of the latest video packet.
     fn frozen(&self, now_ms: u64, last_video_ms: u64) -> bool {
@@ -330,6 +356,7 @@ struct LineContext<'a> {
     canvas: Option<(u32, u32)>,
     tiles: &'a [TileLine],
     frozen_ms: u64,
+    concealed_ms: u64,
     rtt: Option<Duration>,
 }
 
@@ -342,7 +369,7 @@ fn line(m: &Metrics, cx: &LineContext) -> String {
     let _ = write!(
         s,
         "{{\"t\":{},\"session_t\":{},\"dt\":{},\"op\":{{\"render_scale\":{},\"fps\":{},\"recovery\":\"{}\",\
-         \"hold\":\"{}\",\"holding\":{},\"ltr\":{}}}",
+         \"hold\":\"{}\",\"holding\":{},\"ltr\":{},\"after_loss\":\"{}\"}}",
         num(cx.t, 3),
         num(cx.session_t, 3),
         num(cx.dt, 3),
@@ -352,6 +379,7 @@ fn line(m: &Metrics, cx: &LineContext) -> String {
         op.hold.name(),
         m.holding.load(Ordering::Relaxed),
         op.ltr,
+        op.after_loss.name(),
     );
     match cx.canvas {
         Some((w, h)) => {
@@ -427,8 +455,10 @@ fn line(m: &Metrics, cx: &LineContext) -> String {
     let avg = if aus == 0 { "null".into() } else { ms(busy / aus as u32) };
     let _ = write!(
         s,
-        ",\"frozen_ms\":{},\"decode_aus\":{aus},\"decode_avg_ms\":{avg},\"decode_worst_ms\":{},\"presented_fps\":{}",
+        ",\"frozen_ms\":{},\"concealed_ms\":{},\"concealed_pictures\":{},\"decode_aus\":{aus},\"decode_avg_ms\":{avg},\"decode_worst_ms\":{},\"presented_fps\":{}",
         cx.frozen_ms,
+        cx.concealed_ms,
+        take(&m.concealed_pictures),
         if aus == 0 { "null".into() } else { ms(worst) },
         rate(take(&m.presented)),
     );
@@ -457,19 +487,22 @@ pub(super) fn writer(shared: Arc<Shared>, path: PathBuf) {
     // Drop what accumulated while connecting.
     let _ = line(
         m,
-        &LineContext { t: 0.0, session_t: 0.0, dt: 1.0, op: &shared.op(), canvas: None, tiles: &[], frozen_ms: 0, rtt: None },
+        &LineContext { t: 0.0, session_t: 0.0, dt: 1.0, op: &shared.op(), canvas: None, tiles: &[], frozen_ms: 0, concealed_ms: 0, rtt: None },
     );
     for i in 0..MAX_TILES {
         m.take_tile(i);
     }
     let mut start: HashMap<u32, (u64, u64)> = HashMap::new();
     let mut since = Instant::now();
-    let mut frozen_samples = 0u64;
+    let (mut frozen_samples, mut concealed_samples) = (0u64, 0u64);
     while !shared.stopped() {
         std::thread::sleep(SAMPLE_EVERY);
         let now_ms = shared.clock.now_ms();
-        if m.frozen(now_ms, shared.last_video_packet.load(Ordering::Relaxed)) {
+        let last_video = shared.last_video_packet.load(Ordering::Relaxed);
+        if m.frozen(now_ms, last_video) {
             frozen_samples += 1;
+        } else if m.concealed(now_ms, last_video) {
+            concealed_samples += 1;
         }
         let dt = since.elapsed();
         if dt < LINE_EVERY {
@@ -517,9 +550,10 @@ pub(super) fn writer(shared: Arc<Shared>, path: PathBuf) {
             canvas: *shared.canvas.lock(),
             tiles: &tiles,
             frozen_ms: (frozen_samples * SAMPLE_EVERY.as_millis() as u64).min(dt.as_millis() as u64),
+            concealed_ms: (concealed_samples * SAMPLE_EVERY.as_millis() as u64).min(dt.as_millis() as u64),
             rtt: *shared.rtt.lock(),
         };
-        frozen_samples = 0;
+        (frozen_samples, concealed_samples) = (0, 0);
         let l = line(m, &cx);
         if let Err(e) = writeln!(out, "{l}").and_then(|()| out.flush()) {
             tracing::warn!("--stats-json: {e}");
@@ -532,7 +566,7 @@ pub(super) fn writer(shared: Arc<Shared>, path: PathBuf) {
 mod tests {
     use super::*;
     use crate::rtp::assembler::HoldMode;
-    use crate::session::{Fps, OperatingPoint};
+    use crate::session::{AfterLoss, Fps, OperatingPoint};
 
     #[test]
     fn one_sample_per_outage() {
@@ -606,6 +640,19 @@ mod tests {
     }
 
     #[test]
+    fn concealed_rules() {
+        let m = Metrics::default();
+        m.shown(true);
+        assert!(m.concealed(5000, 4950));
+        // Not on an idle stream.
+        assert!(!m.concealed(9000, 4950));
+        // A clean picture after the keyframe ends it.
+        m.shown(false);
+        assert!(!m.concealed(5000, 4950));
+        assert_eq!(m.concealed_pictures.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn interval_loss() {
         assert_eq!(loss_pct((200, 190), Some((100, 100))), 10.0);
         assert_eq!(loss_pct((100, 100), Some((100, 100))), 0.0);
@@ -616,11 +663,18 @@ mod tests {
     }
 
     fn context<'a>(op: &'a OperatingPoint, tiles: &'a [TileLine]) -> LineContext<'a> {
-        LineContext { t: 0.0, session_t: 0.0, dt: 1.0, op, canvas: None, tiles, frozen_ms: 0, rtt: None }
+        LineContext { t: 0.0, session_t: 0.0, dt: 1.0, op, canvas: None, tiles, frozen_ms: 0, concealed_ms: 0, rtt: None }
     }
 
     fn op() -> OperatingPoint {
-        OperatingPoint { render_scale: 0.5, fps: Fps::Thirty, recovery: Recovery::Pli, hold: HoldMode::Off, ltr: false }
+        OperatingPoint {
+            render_scale: 0.5,
+            fps: Fps::Thirty,
+            recovery: Recovery::Pli,
+            hold: HoldMode::Off,
+            ltr: false,
+            after_loss: AfterLoss::Conceal,
+        }
     }
 
     #[test]
@@ -632,6 +686,8 @@ mod tests {
         m.nack_arrived(Duration::from_millis(30));
         m.set_answer_ltrp(Some(false));
         m.decoded(Duration::from_millis(3));
+        m.shown(true);
+        m.shown(false);
         let op = op();
         let tiles = [
             TileLine { loss_pct: 1.0, loss_pre_pct: 3.0, jitter_ms: 2.5, fps: 29.5 },
@@ -647,13 +703,14 @@ mod tests {
                 canvas: Some((2560, 1440)),
                 tiles: &tiles,
                 frozen_ms: 30,
+                concealed_ms: 40,
                 rtt: None,
             },
         );
         assert_eq!(
             l,
             "{\"t\":1.500,\"session_t\":2.000,\"dt\":2.000,\"op\":{\"render_scale\":0.5,\"fps\":30,\
-             \"recovery\":\"pli\",\"hold\":\"off\",\"holding\":false,\"ltr\":false},\"canvas\":[2560,1440],\
+             \"recovery\":\"pli\",\"hold\":\"off\",\"holding\":false,\"ltr\":false,\"after_loss\":\"conceal\"},\"canvas\":[2560,1440],\
              \"answer_ltrp\":false,\"max_tile_fps\":30.0,\"video_pps\":50.0,\"video_bytes_ps\":0.0,\
              \"tiles\":[{\"loss_pct\":1.00,\"loss_pre_pct\":3.00,\"jitter_ms\":2.50,\"fps\":29.5},\
              {\"loss_pct\":0.00,\"loss_pre_pct\":0.00,\"jitter_ms\":0.00,\"fps\":30.0}],\"nacks\":0,\
@@ -662,7 +719,7 @@ mod tests {
              \"kf_loss_fir_pli\":0,\"kf_gap\":1,\"kf_decode\":0,\"kf_damaged\":0,\"kf_adoption\":0,\
              \"kf_reoffer\":0,\"kf_stall\":0,\"kf_hw_fallback\":0,\"kf_other\":0,\"kf_suppressed\":0,\
              \"irap_aus\":0,\"irap_bytes\":0,\"irap_follow_bytes\":0,\"recovery_n\":0,\
-             \"recovery_p50_ms\":null,\"recovery_max_ms\":null,\"frozen_ms\":30,\"decode_aus\":1,\
+             \"recovery_p50_ms\":null,\"recovery_max_ms\":null,\"frozen_ms\":30,\"concealed_ms\":40,\"concealed_pictures\":1,\"decode_aus\":1,\
              \"decode_avg_ms\":3.0,\"decode_worst_ms\":3.0,\"presented_fps\":0.0,\"rtt_ms\":null}"
         );
         // Counters were consumed.

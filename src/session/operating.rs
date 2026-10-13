@@ -1,8 +1,9 @@
 //! The operating point: the levers that trade picture quality for
 //! robustness on a lossy link, switchable mid-session for experiments.
 //!
-//! Fast levers take effect at once: `recovery` (the next keyframe request)
-//! and `hold` (the next access unit with a gap). Slow ones renegotiate:
+//! Fast levers take effect at once: `recovery` (the next keyframe request),
+//! `hold` (the next access unit with a gap) and `after_loss` (the next
+//! access unit fed to the decoder). Slow ones renegotiate:
 //! * `render_scale` asks the host for a display with fewer backing pixels,
 //!   the same path as a window resize: SetDisplayConfiguration, the host's
 //!   layout answer, a 0x1c re-offer, then a new SSRC group starting with an
@@ -50,6 +51,29 @@ impl Fps {
     }
 }
 
+/// What the decoder does between a loss and the next keyframe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum AfterLoss {
+    /// Drop every picture until the next keyframe: the picture freezes.
+    Idr,
+    /// Keep decoding, incomplete access units included (the slices that
+    /// arrived): the picture moves but is smeared until the next keyframe.
+    Conceal,
+}
+
+impl AfterLoss {
+    pub fn name(self) -> &'static str {
+        match self {
+            AfterLoss::Idr => "idr",
+            AfterLoss::Conceal => "conceal",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        [AfterLoss::Idr, AfterLoss::Conceal].into_iter().find(|m| m.name() == s)
+    }
+}
+
 /// Where the client sits between quality and robustness. Held in
 /// [`Shared`] and kept across reconnects.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -64,6 +88,8 @@ pub struct OperatingPoint {
     pub hold: HoldMode,
     /// LTR offered (slow: a re-offer) and LTR acks sent (stop at once).
     pub ltr: bool,
+    /// Fast.
+    pub after_loss: AfterLoss,
     // A codec lever (--codec hevc|h264) belongs here too; it is slow, and
     // likely needs `restart`, since the decoder has to change with it.
 }
@@ -78,12 +104,13 @@ impl fmt::Display for OperatingPoint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "render_scale {} fps {} recovery {} hold {} ltr {}",
+            "render_scale {} fps {} recovery {} hold {} ltr {} after_loss {}",
             self.render_scale,
             self.fps.value(),
             self.recovery.name(),
             self.hold.name(),
-            if self.ltr { "on" } else { "off" }
+            if self.ltr { "on" } else { "off" },
+            self.after_loss.name(),
         )
     }
 }
@@ -98,6 +125,7 @@ pub enum Lever {
     Recovery(Recovery),
     Hold(HoldMode),
     Ltr(bool),
+    AfterLoss(AfterLoss),
 }
 
 impl Lever {
@@ -108,6 +136,7 @@ impl Lever {
             Lever::Recovery(v) => op.recovery = v,
             Lever::Hold(v) => op.hold = v,
             Lever::Ltr(v) => op.ltr = v,
+            Lever::AfterLoss(v) => op.after_loss = v,
         }
     }
 }
@@ -131,6 +160,7 @@ pub fn parse_on_off(s: &str) -> Result<bool, String> {
 
 /// Parses a control line: `render_scale 1|0.5`, `fps 60|30`,
 /// `recovery fir|pli|fir+pli`, `hold auto|on|off`, `ltr on|off`,
+/// `after_loss idr|conceal`,
 /// `keyframe` or `restart` (which ends the session like a dropped connection,
 /// so it exits under `--no-reconnect`). Blank lines and `#` comments give `Ok(None)`.
 pub fn parse_command(line: &str) -> Result<Option<Command>, String> {
@@ -161,6 +191,10 @@ pub fn parse_command(line: &str) -> Result<Option<Command>, String> {
             Lever::Hold(HoldMode::parse(v).ok_or_else(|| format!("unknown hold mode {v:?}"))?)
         }
         "ltr" => Lever::Ltr(parse_on_off(need("on or off")?)?),
+        "after_loss" => {
+            let v = need("idr or conceal")?;
+            Lever::AfterLoss(AfterLoss::parse(v).ok_or_else(|| format!("unknown after_loss {v:?}"))?)
+        }
         "keyframe" | "restart" if arg.is_some() => return Err(format!("{cmd} takes no argument")),
         "keyframe" => return Ok(Some(Command::Keyframe)),
         "restart" => return Ok(Some(Command::Restart)),
@@ -290,6 +324,8 @@ mod tests {
         assert_eq!(parse_command("hold off"), set(Lever::Hold(HoldMode::Off)));
         assert_eq!(parse_command("hold auto # comment"), set(Lever::Hold(HoldMode::Auto)));
         assert_eq!(parse_command("ltr off"), set(Lever::Ltr(false)));
+        assert_eq!(parse_command("after_loss conceal"), set(Lever::AfterLoss(AfterLoss::Conceal)));
+        assert_eq!(parse_command("after_loss idr"), set(Lever::AfterLoss(AfterLoss::Idr)));
         assert_eq!(parse_command("keyframe"), Ok(Some(Command::Keyframe)));
         assert_eq!(parse_command("restart\r"), Ok(Some(Command::Restart)));
         assert_eq!(parse_command(""), Ok(None));
@@ -306,6 +342,8 @@ mod tests {
             "recovery idr",
             "hold maybe",
             "ltr yes",
+            "after_loss ltr",
+            "after_loss",
             "restart now",
             "fps 30 60",
             "warp 9",
@@ -340,6 +378,7 @@ mod tests {
             recovery: Recovery::FirPli,
             hold: HoldMode::Auto,
             ltr: true,
+            after_loss: AfterLoss::Idr,
         };
         let before = op;
         Lever::Hold(HoldMode::Off).set(&mut op);
@@ -347,7 +386,8 @@ mod tests {
         assert_eq!(op.offer_options(), before.offer_options());
         Lever::Fps(Fps::Thirty).set(&mut op);
         Lever::RenderScale(0.5).set(&mut op);
+        Lever::AfterLoss(AfterLoss::Conceal).set(&mut op);
         assert_eq!(op.offer_options(), OfferOptions { fps60: false, ltr: true });
-        assert_eq!(op.to_string(), "render_scale 0.5 fps 30 recovery pli hold off ltr on");
+        assert_eq!(op.to_string(), "render_scale 0.5 fps 30 recovery pli hold off ltr on after_loss conceal");
     }
 }

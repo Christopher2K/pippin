@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 
-use super::{Event, Shared};
+use super::{AfterLoss, Event, Shared};
 use crate::proto::offers::{MediaOffer, SRTP_BLOB_LEN};
 use crate::rtp::assembler::{AccessUnit, Assembler, HoldStats, POLL_EVERY, TileMap};
 use crate::rtp::srtp::{SrtcpReceiver, SrtcpSender, SrtpReceiver, SrtpSender};
@@ -522,9 +522,12 @@ struct DecodeLoop {
     /// tiles would never clear.
     awaiting_idr: bool,
     pts: i64,
-    /// Tile, DONL, whether a hold recovered it and the IRAP epoch, per
-    /// decoder input.
-    origin: HashMap<i64, (usize, Option<u16>, bool, u64)>,
+    /// Tile, DONL, whether a hold recovered it, the IRAP epoch and whether
+    /// it was fed after a loss (concealed), per decoder input.
+    origin: HashMap<i64, (usize, Option<u16>, bool, u64, bool)>,
+    /// `--after-loss conceal` only: a loss since the last IRAP, so what is
+    /// decoded now is concealed. Never set with `idr`, which gates instead.
+    lossy: bool,
     /// IRAPs fed to the decoder so far: a picture from a later epoch than a
     /// loss comes after the keyframe that repaired it.
     epoch: u64,
@@ -681,21 +684,32 @@ impl DecodeLoop {
         for nal in au.nalus.iter().filter(|n| hevc::is_param_set(n)) {
             self.params.absorb(nal);
         }
-        if !au.complete {
+        let conceal = self.shared.op().after_loss == AfterLoss::Conceal;
+        if !conceal && self.lossy {
+            // Switched to idr during a loss: drop until the keyframe.
+            self.lossy = false;
             self.awaiting_idr = true;
+        }
+        if !au.complete {
             self.loss_keyframe(tile, self.epoch, KeyframeCause::Gap);
-            return;
+            if !conceal {
+                self.awaiting_idr = true;
+                return;
+            }
+            // Concealing: decode the slices that did arrive.
+            self.lossy = true;
         }
         if !au.nalus.iter().any(|n| hevc::is_slice(n)) {
             return;
         }
-        let irap = au.nalus.iter().any(|n| hevc::is_irap(n));
+        // Part of a keyframe is not one: it doesn't restart the decoder.
+        let irap = au.complete && au.nalus.iter().any(|n| hevc::is_irap(n));
         let bytes: u64 = au.nalus.iter().map(|n| n.len() as u64).sum();
         let m = &self.shared.metrics;
         if irap {
             m.irap_aus.fetch_add(1, Ordering::Relaxed);
             m.irap_bytes.fetch_add(bytes, Ordering::Relaxed);
-        } else if tile < 32 && self.irap_follow & (1 << tile) != 0 {
+        } else if au.complete && tile < 32 && self.irap_follow & (1 << tile) != 0 {
             self.irap_follow &= !(1 << tile);
             m.irap_follow_bytes.fetch_add(bytes, Ordering::Relaxed);
         }
@@ -715,6 +729,7 @@ impl DecodeLoop {
             }
             self.active_sps = self.params.sps.clone();
             self.awaiting_idr = false;
+            self.lossy = false;
             self.epoch += 1;
             self.irap_follow = follow_mask(self.shared.tiles.load(Ordering::Relaxed) as usize, tile);
             self.params.write(&mut annexb);
@@ -724,7 +739,7 @@ impl DecodeLoop {
         }
 
         self.pts += 1;
-        self.origin.insert(self.pts, (tile, au.donl, au.recovered, self.epoch));
+        self.origin.insert(self.pts, (tile, au.donl, au.recovered, self.epoch, self.lossy));
         let mut pictures = Vec::new();
         if let Some(d) = self.dump.as_mut() {
             let _ = std::io::Write::write_all(d, &annexb);
@@ -736,7 +751,11 @@ impl DecodeLoop {
         self.stats.record(slices, pictures.len(), took);
         self.shared.metrics.decoded(took);
         if !ok {
-            self.awaiting_idr = true;
+            if conceal {
+                self.lossy = true;
+            } else {
+                self.awaiting_idr = true;
+            }
             self.loss_keyframe(tile, self.epoch, KeyframeCause::DecodeError);
         }
         let floor = self.pts - 256;
@@ -769,13 +788,18 @@ impl DecodeLoop {
     }
 
     fn publish(&mut self, pic: Picture) {
-        let Some((tile, donl, recovered, epoch)) = self.origin.remove(&pic.pts) else {
+        let Some((tile, donl, recovered, epoch, concealed)) = self.origin.remove(&pic.pts) else {
             return;
         };
         self.shared.metrics.picture(tile, epoch, self.shared.clock.now_ms(), Instant::now());
+        self.shared.metrics.shown(concealed);
         if pic.damaged {
             if recovered {
                 self.shared.recovered_damaged.fetch_add(1, Ordering::Relaxed);
+            }
+            if self.shared.op().after_loss == AfterLoss::Conceal {
+                // Pictures referencing this one are smeared too.
+                self.lossy = true;
             }
             // Repaired by the next IRAP after this picture's, not by the
             // next clean P picture (it may still reference the damage).
@@ -857,6 +881,7 @@ pub(super) fn decoder(shared: Arc<Shared>, rx: Receiver<DecoderMsg>, fb: Sender<
         origin: HashMap::new(),
         epoch: 0,
         irap_follow: 0,
+        lossy: false,
         fed_without_output: hw.then_some(0),
         batch: Vec::new(),
         sync_tiles,
@@ -880,7 +905,9 @@ pub(super) fn decoder(shared: Arc<Shared>, rx: Receiver<DecoderMsg>, fb: Sender<
                 // A new stream: an open outage belongs to the old one, and
                 // its recovery would be the adoption's.
                 shared.metrics.end_outage();
+                shared.metrics.shown(false);
                 st.irap_follow = 0;
+                st.lossy = false;
                 st.batch.clear();
                 st.batch_started = None;
                 // New SSRC group: new parameter sets will follow.
@@ -1192,7 +1219,8 @@ mod tests {
                 DecoderMsg::Reset => panic!("unexpected reset"),
             })
             .collect();
-        // The decoder sees it as lost (and then waits for a keyframe).
-        assert_eq!(got, [(1, true, 1), (1, false, 0)]);
+        // The decoder sees it as lost (and then waits for a keyframe, or
+        // conceals with the slice that arrived).
+        assert_eq!(got, [(1, true, 1), (1, false, 1)]);
     }
 }

@@ -93,6 +93,11 @@ struct Cli {
     /// frames, so the host may recover from loss without a keyframe.
     #[arg(long, default_value = "on", value_name = "on|off", action = clap::ArgAction::Set, value_parser = session::parse_on_off)]
     ltr: bool,
+    /// What to show between a loss and the next keyframe: idr freezes the
+    /// picture (drops everything until the keyframe); conceal keeps decoding
+    /// whatever arrived, so the picture keeps moving but is smeared.
+    #[arg(long, value_enum, default_value_t = session::AfterLoss::Idr)]
+    after_loss: session::AfterLoss,
     /// Append one JSON line of link and recovery metrics per second to this
     /// file, for experiments.
     #[arg(long)]
@@ -360,6 +365,7 @@ fn connect(
             recovery: cli.recovery,
             hold: cli.hold,
             ltr: cli.ltr,
+            after_loss: cli.after_loss,
         })),
         stats_json: cli.stats_json.clone(),
         // Debug only: switch operating-point levers mid-session by writing

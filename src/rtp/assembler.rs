@@ -47,7 +47,8 @@ pub struct AccessUnit {
     pub ssrc: u32,
     pub nalus: Vec<Vec<u8>>,
     pub donl: Option<u16>,
-    /// False if packets were lost; only parameter sets are kept then.
+    /// False if packets were lost; the NAL units that arrived whole are
+    /// kept, for parameter sets and for concealment.
     pub complete: bool,
     /// Complete only because a hold let retransmissions or late packets in.
     pub recovered: bool,
@@ -483,10 +484,7 @@ impl Assembler {
             }
         }
         let refs = g.payloads();
-        let mut nalus = hevc::depayload(&refs);
-        if !complete {
-            nalus.retain(|n| hevc::is_param_set(n));
-        }
+        let nalus = hevc::depayload(&refs);
         let donl = hevc::first_donl(&refs);
         if complete
             && self.linked.contains(&key.0)
@@ -662,7 +660,8 @@ mod tests {
         assert!(a.evict(t0 + a.wait() / 2).is_empty());
         let au = one(a.evict(t0 + a.wait()));
         assert!(!au.complete);
-        assert!(au.nalus.is_empty());
+        // The slice that did arrive is kept, for concealment.
+        assert_eq!(au.nalus.len(), 1);
     }
 
     #[test]
@@ -721,12 +720,13 @@ mod tests {
         let t1 = t0 + Duration::from_millis(5);
         assert!(a.push(pkt(5, 103, 2, false, single(1)), t1).is_empty());
         assert!(a.push(pkt(5, 104, 2, true, single(1)), t1).is_empty());
-        // The held AU comes out incomplete with only its parameter sets (the
+        // The held AU comes out incomplete with what arrived whole (the
         // decoder then asks for a keyframe), followed by the one behind it.
         let aus = a.evict(t0 + a.wait());
         assert_eq!(aus.len(), 2);
         assert!(!aus[0].complete);
-        assert_eq!(aus[0].nalus, vec![vec![hevc::NAL_VPS << 1, 1, 0xaa]]);
+        assert_eq!(aus[0].nalus.len(), 2);
+        assert_eq!(aus[0].nalus[0], vec![hevc::NAL_VPS << 1, 1, 0xaa]);
         assert!(aus[1].complete);
         // The retransmission arriving too late is dropped.
         assert!(a.push(pkt(5, 101, 1, false, single(1)), t0 + a.wait()).is_empty());

@@ -41,7 +41,7 @@ use crate::rtp::stats::ReceiverStats;
 use crate::video::decoder::{DecoderKind, Picture};
 
 pub use media::{Feedback, KeyframeCause};
-pub use operating::{Fps, OperatingPoint, SharedOp, parse_on_off};
+pub use operating::{AfterLoss, Fps, OperatingPoint, SharedOp, parse_on_off};
 
 use crate::errors::Failure;
 

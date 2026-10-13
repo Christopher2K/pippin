@@ -34,7 +34,9 @@ client window.
   holds in a row go unfilled, since a host that doesn't retransmit makes
   each hold pure delay; `on`/`off` fix it. `--recovery fir|pli|fir+pli`
   picks the keyframe request, `--ltr on|off` long-term references, and
-  `--fps 60|30` the offered frame rate.
+  `--fps 60|30` the offered frame rate. `--after-loss idr` (default) drops
+  pictures until the next keyframe, freezing the picture; `conceal` keeps
+  decoding what arrived, so it keeps moving but smeared until then.
 
 ## Experiments
 
@@ -43,16 +45,16 @@ operating point and what the host answered (canvas, LTR, per-tile picture
 rate), packet and byte rates, per-tile loss before and after repair and
 jitter, NACKs and how fast retransmissions arrive, holds, keyframe requests
 by kind and by cause, keyframe sizes, recovery time per loss outage, frozen
-time, decode times, presented frames and round trip. Each field is
+and concealed time, decode times, presented frames and round trip. Each field is
 documented in `src/session/metrics.rs`.
 
 For switching levers mid-session without a GUI, set
 `MACSHARE_CONTROL_FIFO=/tmp/macshare.ctl` (created as a FIFO if missing) and
 write commands to it, e.g. `echo 'hold off' > /tmp/macshare.ctl`:
 `render_scale 1|0.5`, `fps 60|30`, `recovery fir|pli|fir+pli`,
-`hold auto|on|off`, `ltr on|off`, `keyframe` (ask for one now) and
-`restart` (reconnect with the current settings; with `--no-reconnect` it
-exits instead). `recovery` and `hold`
+`hold auto|on|off`, `ltr on|off`, `after_loss idr|conceal`, `keyframe`
+(ask for one now) and `restart` (reconnect with the current settings; with
+`--no-reconnect` it exits instead). `recovery`, `hold` and `after_loss`
 apply at once; `render_scale` re-requests the display like a resize; `fps`
 and `ltr` re-offer the media session on the open connection.
 
