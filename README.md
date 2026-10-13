@@ -1,6 +1,6 @@
 # macshare
 
-macshare lets you connect from Linux to a Mac using the high-performance
+macshare is a high-performance remote desktop client for the high performance
 mode of macOS Screen Sharing. Apple normally only offers that mode between
 two Macs; macshare brings it to Linux.
 
@@ -129,13 +129,10 @@ For network experiments:
 
 ## Credits
 
-macshare is built on
-[iShareScreen](https://github.com/renegadelink/iShareScreen) by
-[renegadelink](https://github.com/renegadelink), who reverse-engineered
-Apple's high-performance Screen Sharing protocol. Everything macshare knows
-about the wire format comes from their implementation and documentation.
-macshare is a separate implementation written in Rust, and any bugs in it
-are ours.
+macshare stands on the shoulders of
+[iShareScreen](https://github.com/renegadelink/iShareScreen), which 
+reverse-engineered Apple's high-performance Screen Sharing protocol. 
+macshare is a separate implementation written in Rust.
 
 ## License
 
