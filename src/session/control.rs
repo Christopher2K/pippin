@@ -203,6 +203,7 @@ impl ControlReader {
             // session is offered again.
             tracing::info!("geometry changed; re-offering media session");
             self.shared.touch(&self.shared.renegotiated);
+            self.shared.touch(&self.shared.geometry_changed);
             self.control.reoffer();
             let _ = self.feedback.send(Feedback::Keyframe(None));
         }
