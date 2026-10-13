@@ -14,7 +14,7 @@ use crate::proto::offers::{MediaOffer, SRTP_BLOB_LEN};
 use crate::rtp::assembler::{AccessUnit, Assembler, TileMap};
 use crate::rtp::srtp::{SrtcpReceiver, SrtcpSender, SrtpReceiver, SrtpSender};
 use crate::rtp::{hevc, rtcp};
-use crate::video::decoder::{Decoder, DecoderOptions, Picture};
+use crate::video::decoder::{self, Decoder, DecoderOptions, Picture};
 
 /// Requests from the media threads to the feedback sender.
 pub enum Feedback {
@@ -254,6 +254,8 @@ struct DecodeLoop {
     pts: i64,
     origin: HashMap<i64, (usize, Option<u16>)>,
     fed_without_output: Option<u32>,
+    /// No backend could be reopened; the session has been closed.
+    dead: bool,
     /// Decoded pictures of the frame being gathered, and when it started.
     batch: Vec<(usize, Picture)>,
     /// Gather tiles into frames; otherwise each picture is shown at once.
@@ -386,7 +388,11 @@ impl DecodeLoop {
                 }
                 self.decoder = d;
             }
-            Err(e) => tracing::error!("restarting decoder: {e:#}"),
+            Err(e) => {
+                // Even software decoding failed; retrying every AU won't help.
+                self.shared.sink.emit(Event::Closed(Some(format!("video decoder: {e:#}"))));
+                self.dead = true;
+            }
         }
         self.awaiting_idr = true;
         self.origin.clear();
@@ -452,15 +458,22 @@ impl DecodeLoop {
                 self.fed_without_output = None;
             }
         }
-        for p in pictures {
-            self.publish(p);
-        }
         let silent = self.fed_without_output.is_some_and(|n| n >= HW_GRACE_AUS);
         if silent || self.decoder.broken() {
             let why = if silent { "produced no pictures" } else { "can't show this stream" };
             tracing::warn!("{:?} decoder {why}; falling back", self.decoder.backend());
+            decoder::remember_broken(self.decoder.backend());
+            // The old backend's pictures may have another layout than the
+            // next one's; mixed in one frame they'd make the renderer
+            // rebuild its textures mid-upload. Drop them all.
+            self.batch.clear();
+            self.batch_started = None;
             self.restart(true);
             let _ = self.fb.send(Feedback::Keyframe(None));
+            return;
+        }
+        for p in pictures {
+            self.publish(p);
         }
     }
 
@@ -538,8 +551,9 @@ pub(super) fn decoder(shared: Arc<Shared>, rx: Receiver<DecoderMsg>, fb: Sender<
         gather: GatherStats::new(),
         stats: DecodeStats::new(),
         dump: open_dump(),
+        dead: false,
     };
-    while !shared.stopped() {
+    while !shared.stopped() && !st.dead {
         match rx.recv_timeout(st.wait()) {
             Ok(DecoderMsg::Au { tile, au }) => {
                 st.access_unit(tile, au);

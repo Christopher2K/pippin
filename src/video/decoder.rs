@@ -7,6 +7,7 @@
 
 use std::ffi::{CStr, CString};
 use std::ptr;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use anyhow::{Result, anyhow, bail};
 
@@ -146,6 +147,18 @@ impl Backend {
     }
 }
 
+/// Hardware backends that failed on the host's stream, as `1 << Backend`.
+/// Kept for the process so reconnects skip them instead of wasting a
+/// keyframe on each.
+static BROKEN: AtomicU8 = AtomicU8::new(0);
+
+/// Skips `backend` in `Decoder::open_first` from now on.
+pub fn remember_broken(backend: Backend) {
+    if backend.is_hw() {
+        BROKEN.fetch_or(1 << backend as u8, Ordering::Relaxed);
+    }
+}
+
 pub struct Decoder {
     ctx: *mut ffi::AVCodecContext,
     pkt: *mut ffi::AVPacket,
@@ -208,6 +221,10 @@ impl Decoder {
     pub fn open_first(backends: &[Backend], opts: &DecoderOptions) -> Result<Self> {
         let mut last = None;
         for &b in backends {
+            if BROKEN.load(Ordering::Relaxed) & (1 << b as u8) != 0 {
+                tracing::debug!("skipping {b:?}: it failed on this stream earlier");
+                continue;
+            }
             match Self::open(b, opts) {
                 Ok(d) => return Ok(d),
                 // Expected for auto on most machines; not when asked for.
@@ -270,7 +287,12 @@ impl Decoder {
             if let Some((ty, fmt, name)) = hw {
                 let mut dev = ptr::null_mut();
                 let name_ptr = name.as_ref().map_or(ptr::null(), |n| n.as_ptr());
+                // No timeout: a driver that hangs here (or later inside a
+                // hardware decode) stalls video for good and no fallback
+                // runs. These logs show where it stopped.
+                tracing::debug!("{backend:?}: creating device {name:?}");
                 let r = ffi::av_hwdevice_ctx_create(&mut dev, ty, name_ptr, ptr::null_mut(), 0);
+                tracing::debug!("{backend:?}: device created: {}", if r < 0 { av_err(r) } else { "ok".into() });
                 if r < 0 {
                     bail!("{backend:?} device: {}", av_err(r));
                 }
