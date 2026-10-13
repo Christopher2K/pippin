@@ -1,107 +1,141 @@
 # macshare
 
-A native Linux client for macOS Screen Sharing's high-performance mode:
-HEVC 4:4:4 over SRTP, with the Mac's virtual display sized to the window.
+macshare lets you connect from Linux to a Mac using the high-performance
+mode of macOS Screen Sharing. Apple normally only offers that mode between
+two Macs; macshare brings it to Linux.
 
-## Features
+There's nothing to install on the Mac. Turn on Screen Sharing and connect,
+and you get sharp HEVC 4:4:4 video with the Mac's display resized to fit
+your window. Text and images copy and paste in both directions, the cursor
+is drawn locally so it never lags behind your mouse, and video is decoded
+on the GPU whenever possible.
 
-- Apple's high-performance protocol: SRP auth, encrypted control channel,
-  tiled HEVC over SRTP.
-- Auto-resolution: the Mac's display follows the window size (up to 4K).
-- Clipboard, both ways: text and images (PNG/TIFF). X11 and Wayland.
-- Native cursor, so pointer movement has no round-trip lag.
-- Hardware decoding: CUDA, then VAAPI, then software.
-- Loss recovery: NACKs, keyframe requests and stall detection.
+## Quick start
 
-## Requirements
-
-- Build: FFmpeg dev libraries (`libavcodec`, `libavutil`) and `clang`.
-- A wgpu-capable GPU (Vulkan or GL).
-- Hardware decoding (optional): FFmpeg with CUDA and/or VAAPI. Needs an
-  NVIDIA Turing+ or Intel Ice Lake+ GPU (`vainfo` should list
-  `VAProfileHEVCMain444`). Most AMD GPUs only decode 4:2:0.
-- On the Mac: Screen Sharing enabled for your account.
-- Free local UDP ports 5900 and 5901.
-- A large socket receive buffer. 4K bursts reach ~670 KB, past the
-  default:
-
-  ```sh
-  sudo sysctl -w net.core.rmem_max=33554432
-  ```
-
-## Usage
+High-performance mode needs an Apple silicon Mac running macOS Sonoma or
+later. On the Mac, turn on System Settings → General → Sharing → Screen
+Sharing. Then, on Linux:
 
 ```sh
 cargo build --release
 ./target/release/macshare my-mac.local -u alice
+```
+
+To build you'll need `clang` and the FFmpeg development libraries
+(`libavcodec`, `libavutil`). To run it you'll need a GPU that wgpu supports
+(Vulkan or GL), and UDP ports 5900 and 5901 free.
+
+## Passwords
+
+macshare checks these places for your password, in order:
+
+1. `--password` or the `MACSHARE_PASSWORD` environment variable
+2. stdin, if you pass `--password-stdin`
+3. your desktop keyring
+4. a prompt
+
+```sh
 pass show mac | ./target/release/macshare my-mac.local -u alice --password-stdin
 ```
 
-The password comes from `--password`/`MACSHARE_PASSWORD`, then
-`--password-stdin`, then the keyring, then a prompt. Without a terminal
-you get a connect dialog instead (`--dialog` forces it). Saving to the
-keyring is opt-in: you're asked after the prompt, or pass
-`--save-password`. Nothing offers to save when no keyring is available.
-`--forget-password` removes a saved password.
+If you typed the password at a prompt, macshare asks whether to save it to
+the keyring (or saves it straight away with `--save-password`). It won't
+ask if no keyring is running. `--forget-password` removes a saved password.
+
+When there's no terminal, for example when launched from a `.desktop` file,
+macshare shows a small connect dialog instead of prompting. `--dialog`
+shows it even from a terminal.
+
+## Options
 
 | Option | |
 |---|---|
-| `--session share\|alt` | Share the console user's screen (default), or log in to a separate session |
-| `--scale N`, `--no-auto-resize` | Override the 1×/2× display scale, or stop following the window |
-| `--render-scale 0.5` | Stream a quarter of the pixels on a 2× window, for slow links |
-| `--decoder auto\|cuda\|vaapi\|software` | Pick the decoder; `--vaapi-device` picks the render node |
-| `--after-loss idr\|conceal` | After a loss, freeze until the next keyframe (default), or keep showing a smeared picture |
-| `--hold auto\|on\|off` | Wait briefly for retransmissions; `auto` stops once the host clearly doesn't send them |
-| `--swap-ctrl-cmd` | Ctrl acts as ⌘ (Super is ⌘ and Alt is ⌥ by default) |
-| `--stats-json FILE` | Write per-second stats as JSON lines (fields in `src/session/metrics.rs`) |
-| `-v`, `-vv` | Debug / trace logging. Passwords and clipboard contents are never logged |
+| `--session share\|alt` | Share the logged-in user's screen (default), or log in to a separate session |
+| `--scale N` | Display scale. Defaults to 2× on HiDPI screens and 1× otherwise |
+| `--no-auto-resize` | Keep the Mac's display at a fixed size instead of following the window |
+| `--render-scale 0.5` | On a 2× window, stream a quarter of the pixels: slightly softer text for much less bandwidth |
+| `--decoder auto\|cuda\|vaapi\|software` | Choose the video decoder. `--vaapi-device` picks the render node |
+| `--after-loss idr\|conceal` | After packet loss, freeze until the next keyframe (default), or keep going with a smeared picture |
+| `--swap-ctrl-cmd` | Use Ctrl as ⌘. By default Super is ⌘ and Alt is ⌥ |
+| `-v`, `-vv` | Debug or trace logging. Passwords and clipboard contents are never logged |
 
-For experiments, set `MACSHARE_CONTROL_FIFO=/tmp/macshare.ctl` and send
-commands to it while the session runs, e.g. `echo 'after_loss conceal' >
-/tmp/macshare.ctl`. Commands: `render_scale`, `hold`, `after_loss`,
-`recovery`, `ltr`, `fps`, `keyframe` and `restart`.
+## Hardware decoding
 
-## Lossy networks
+The Mac only sends HEVC 4:4:4, which not every GPU can decode. NVIDIA
+Turing or newer (through CUDA) and Intel Ice Lake or newer (through VAAPI)
+can. AMD GPUs can't, so macshare falls back to software decoding there; it
+works fine but uses more CPU. To check your VAAPI driver, look for
+`VAProfileHEVCMain444` in the output of `vainfo`.
 
-Measured against a real Mac:
+By default macshare tries CUDA first, then VAAPI, then software, moving on
+to the next if one fails.
 
-- The Mac doesn't retransmit video, so each lost packet costs a whole
-  keyframe (~57 KB).
-- At 1% loss the picture is frozen about half the time. Keyframe request
-  type, long-term references, 30 fps and scale made no measurable
-  difference.
-- `--after-loss conceal` turns about a fifth of that frozen time into
-  moving but smeared video.
-- On slow links, use `--render-scale 0.5`.
+## Slow and lossy networks
+
+The Mac never resends lost video packets, so each lost packet means
+waiting for a whole new keyframe. At 1% packet loss the picture is frozen
+about half the time, and none of the protocol's settings made a difference
+in our testing.
+
+Two options do help:
+
+- `--render-scale 0.5` uses much less bandwidth and makes keyframes
+  smaller.
+- `--after-loss conceal` keeps the picture moving after a loss. It looks
+  smeared until the next keyframe arrives, but it isn't frozen.
+
+## 4K
+
+When you switch to 4K, the decoder can take a few seconds to catch up.
+In the meantime incoming video piles up in the kernel (we've measured
+around 670 KB). If your system still has the default UDP receive buffer
+limit, raise it so frames aren't dropped:
+
+```sh
+sudo sysctl -w net.core.rmem_max=8388608
+```
+
+Some software, such as Syncthing, already raises this for you.
 
 ## Limitations
 
 - No audio.
-- Clipboard covers text and images only, no files.
-- IPv4 only, and one client per machine, because the media ports are
-  fixed.
+- Copy and paste works for text and images, but not files.
+- Linux only, on Wayland or X11.
+- IPv4 only, and only one copy of macshare per machine, because the media
+  ports are fixed.
 
-## Tests
+## Development
 
 ```sh
 cargo test
 ```
 
-`src/interop_tests.rs` checks byte-for-byte against vectors from the
-reference implementation. The decoder tests are `--ignored` and need sample
-streams. Generate them with `ffmpeg … -c:v libx265 -pix_fmt yuv444p -f hevc
-/tmp/t444.hevc` (also `t420`, `t444p10`, and a `twide` stream at 8448×256),
-then run `MACSHARE_TEST_HEVC_DIR=/tmp cargo test --release -- --ignored
---skip bench`.
+`src/interop_tests.rs` checks the wire format byte for byte against
+vectors from the reference implementation. The decoder tests are marked
+`--ignored` because they need sample HEVC streams in
+`MACSHARE_TEST_HEVC_DIR`. You can make these with ffmpeg's `testsrc2` and
+`libx265`; `src/video/decoder.rs` lists the files it expects.
+
+For network experiments:
+
+- `--stats-json FILE` writes a line of stats every second. The fields are
+  described in `src/session/metrics.rs`.
+- Set `MACSHARE_CONTROL_FIFO=/tmp/macshare.ctl` to change settings while
+  a session is running, e.g. `echo 'render_scale 0.5' > /tmp/macshare.ctl`.
+  The commands are `render_scale`, `after_loss`, `hold`, `recovery`, `ltr`,
+  `fps`, `keyframe` and `restart`, and they're documented in
+  `src/session/operating.rs`.
 
 ## Credits
 
-Built on [iShareScreen](https://github.com/renegadelink/iShareScreen) by
+macshare is built on
+[iShareScreen](https://github.com/renegadelink/iShareScreen) by
 [renegadelink](https://github.com/renegadelink), who reverse-engineered
 Apple's high-performance Screen Sharing protocol. Everything macshare knows
-about the wire format comes from their implementation and documentation,
-and the interop tests use vectors generated by their code. macshare is a
-separate Rust implementation; its bugs are ours.
+about the wire format comes from their implementation and documentation.
+macshare is a separate implementation written in Rust, and any bugs in it
+are ours.
 
 ## License
 
