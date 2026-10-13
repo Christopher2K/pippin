@@ -1,5 +1,6 @@
 //! UDP media threads: SRTP video receive, HEVC decode and RTCP feedback.
 
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap};
 use std::io::ErrorKind;
 use std::net::{SocketAddrV4, UdpSocket};
@@ -13,6 +14,7 @@ use super::{Event, Shared};
 use crate::proto::offers::{MediaOffer, SRTP_BLOB_LEN};
 use crate::rtp::assembler::{AccessUnit, Assembler, TileMap};
 use crate::rtp::srtp::{SrtcpReceiver, SrtcpSender, SrtpReceiver, SrtpSender};
+use crate::rtp::stats::{ReceiverStats, VIDEO_CLOCK_HZ};
 use crate::rtp::{hevc, rtcp};
 use crate::video::decoder::{Backend, Decoder, DecoderOptions, Picture};
 
@@ -107,8 +109,12 @@ pub(super) fn video_rx(
                             }
                             next_seq.insert(p.ssrc, p.seq.wrapping_add(1));
                         }
-                        if let Some(ext) = srtp.extended_seq(p.ssrc) {
-                            shared.extended_seqs.lock().insert(p.ssrc, ext);
+                        let (index, at) = (srtp.last_index(), shared.clock.0.elapsed());
+                        match shared.rx_stats.lock().entry(p.ssrc) {
+                            Entry::Occupied(mut e) => e.get_mut().record(index, p.ts, at),
+                            Entry::Vacant(e) => {
+                                e.insert(ReceiverStats::new(index, p.ts, at));
+                            }
                         }
                     }
                     if let Some(au) = asm.push(p) {
@@ -156,7 +162,7 @@ pub(super) fn video_rx(
                 srtp.forget(|s| ssrcs.contains(&s));
                 next_seq.clear();
                 *shared.tile_ssrcs.lock() = ssrcs;
-                shared.extended_seqs.lock().clear();
+                shared.rx_stats.lock().clear();
                 shared.renegotiated.store(0, Ordering::Relaxed);
                 // Don't let the stall timer immediately allow another switch.
                 shared.touch(&shared.last_frame);
@@ -561,6 +567,42 @@ const STALL_KEYFRAME_MS: u64 = 3000;
 const STALL_KEYFRAME_EVERY: Duration = Duration::from_millis(1500);
 const STALL_RESET_MS: u64 = 8000;
 
+/// Per-tile packet loss and jitter, logged every STATS_EVERY at debug level
+/// so `-v` shows link quality.
+struct LinkStats {
+    since: Instant,
+    /// Expected and received counts per SSRC at the start of the period.
+    start: HashMap<u32, (u64, u64)>,
+}
+
+impl LinkStats {
+    fn new() -> Self {
+        Self { since: Instant::now(), start: HashMap::new() }
+    }
+
+    /// Takes `(ssrc, expected, received, jitter)` for the tiles with packets.
+    fn record(&mut self, tiles: &[u32], now: &[(u32, u64, u64, u32)]) {
+        if self.since.elapsed() < STATS_EVERY {
+            return;
+        }
+        let mut parts = Vec::new();
+        for (t, ssrc) in tiles.iter().enumerate() {
+            let Some(&(_, exp, rcv, jitter)) = now.iter().find(|n| n.0 == *ssrc) else { continue };
+            // Stats restart with the SSRC group; count from zero then.
+            let (exp0, rcv0) = self.start.get(ssrc).copied().filter(|&(e, _)| e <= exp).unwrap_or((0, 0));
+            let (exp, rcv) = (exp - exp0, rcv.saturating_sub(rcv0));
+            let loss = if exp == 0 { 0.0 } else { exp.saturating_sub(rcv) as f64 * 100.0 / exp as f64 };
+            let jitter_ms = jitter as f64 * 1000.0 / VIDEO_CLOCK_HZ as f64;
+            parts.push(format!("{t}: {loss:.1}% {jitter_ms:.1} ms"));
+        }
+        if !parts.is_empty() {
+            tracing::debug!("link: loss/jitter per tile {}", parts.join(", "));
+        }
+        self.since = Instant::now();
+        self.start = now.iter().map(|&(ssrc, e, r, _)| (ssrc, (e, r))).collect();
+    }
+}
+
 struct FeedbackSender {
     shared: Arc<Shared>,
     s: FeedbackSockets,
@@ -572,6 +614,7 @@ struct FeedbackSender {
     last_ltr: Option<u16>,
     last_stall_keyframe: Option<Instant>,
     stall_reset_done: bool,
+    link: LinkStats,
 }
 
 impl FeedbackSender {
@@ -628,19 +671,31 @@ impl FeedbackSender {
         let hb = self.audio.protect(AUDIO_PT, &HEARTBEAT_PAYLOAD);
         let _ = self.s.ctrl.send_to(&hb, self.s.ctrl_dest);
 
+        let ssrcs = self.shared.tile_ssrcs.lock().clone();
+        let mut link = Vec::with_capacity(ssrcs.len());
         let sources: Vec<rtcp::ReportSource> = {
-            let ssrcs = self.shared.tile_ssrcs.lock().clone();
-            let seqs = self.shared.extended_seqs.lock();
+            let mut stats = self.shared.rx_stats.lock();
             let srs = self.shared.sender_reports.lock();
             ssrcs
                 .iter()
-                .map(|&ssrc| rtcp::ReportSource {
-                    ssrc,
-                    extended_seq: seqs.get(&ssrc).copied().unwrap_or(0),
-                    last_sr: srs.get(&ssrc).map(|&(mid, at)| (mid, at.elapsed().as_secs_f64())),
+                .map(|&ssrc| {
+                    let r = stats.get_mut(&ssrc).map(|s| {
+                        link.push((ssrc, s.expected(), s.received(), s.jitter()));
+                        s.report()
+                    });
+                    let r = r.unwrap_or_default();
+                    rtcp::ReportSource {
+                        ssrc,
+                        fraction_lost: r.fraction_lost,
+                        cumulative_lost: r.cumulative_lost,
+                        extended_seq: r.extended_seq,
+                        jitter: r.jitter,
+                        last_sr: srs.get(&ssrc).map(|&(mid, at)| (mid, at.elapsed().as_secs_f64())),
+                    }
                 })
                 .collect()
         };
+        self.link.record(&ssrcs, &link);
         let mut report = Vec::new();
         if n.is_multiple_of(SR_EVERY_TICKS) {
             report.extend(rtcp::empty_sender_report(self.our_ssrc));
@@ -696,6 +751,7 @@ pub(super) fn feedback(
         last_ltr: None,
         last_stall_keyframe: None,
         stall_reset_done: false,
+        link: LinkStats::new(),
     };
     let mut next_tick = Instant::now();
     let mut n = 0u64;

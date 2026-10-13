@@ -106,14 +106,24 @@ struct RocState {
 pub struct SrtpReceiver {
     keys: SessionKeys,
     states: HashMap<u32, RocState>,
+    /// SRTP index (ROC << 16 | seq) of the last packet unprotected.
+    last_index: u64,
 }
 
 impl SrtpReceiver {
     pub fn new(blob: &[u8; SRTP_BLOB_LEN]) -> Self {
-        Self { keys: SessionKeys::derive(blob, false), states: HashMap::new() }
+        Self { keys: SessionKeys::derive(blob, false), states: HashMap::new(), last_index: 0 }
     }
 
-    /// Extended highest sequence number seen for `ssrc` (for receiver reports).
+    /// The packet index of the last successful `unprotect`: the extended
+    /// sequence number, with the rollover count proven by the auth tag.
+    pub fn last_index(&self) -> u64 {
+        self.last_index
+    }
+
+    /// Extended highest sequence number seen for `ssrc`. Receiver reports
+    /// use `rtp::stats` instead; this checks the rollover tracking in tests.
+    #[cfg(test)]
     pub fn extended_seq(&self, ssrc: u32) -> Option<u32> {
         self.states.get(&ssrc).map(|s| (s.roc << 16) | s.max_seq as u32)
     }
@@ -163,6 +173,7 @@ impl SrtpReceiver {
         let mut payload = body[hdr..].to_vec();
         let index = ((roc as u64) << 16) | seq as u64;
         self.keys.apply(self.keys.rtp_iv(ssrc, index), &mut payload);
+        self.last_index = index;
 
         let entry = self.states.entry(ssrc).or_insert(RocState { roc, max_seq: seq });
         if ((roc as u64) << 16 | seq as u64) > ((entry.roc as u64) << 16 | entry.max_seq as u64) {
@@ -282,6 +293,7 @@ mod tests {
             let got = rx.unprotect(&pkt).expect("decrypts");
             assert_eq!(got.payload, b"\x00\x68\x34\x00");
             assert_eq!(got.seq, (0xfffe + i) as u16);
+            assert_eq!(rx.last_index(), 0xfffe + i);
         }
         assert_eq!(rx.extended_seq(0x1234_5678), Some(0x1_0001));
     }
