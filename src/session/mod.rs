@@ -185,6 +185,9 @@ pub struct Shared {
     tile_ssrcs: Mutex<Vec<u32>>,
     extended_seqs: Mutex<HashMap<u32, u32>>,
     sender_reports: Mutex<HashMap<u32, (u32, Instant)>>,
+    /// Smoothed round trip from host report blocks echoing our SRs; `None`
+    /// until the host sends one.
+    rtt: Mutex<Option<Duration>>,
     canvas: Mutex<Option<(u32, u32)>>,
     /// The control connection while the handshake runs, for shutdown().
     connecting: Mutex<Option<TcpStream>>,
@@ -238,6 +241,7 @@ impl Session {
             tile_ssrcs: Mutex::new(Vec::new()),
             extended_seqs: Mutex::new(HashMap::new()),
             sender_reports: Mutex::new(HashMap::new()),
+            rtt: Mutex::new(None),
             canvas: Mutex::new(None),
             connecting: Mutex::new(None),
             udp: Mutex::new(Vec::new()),

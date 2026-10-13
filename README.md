@@ -21,8 +21,9 @@ client window.
   pointer movement has no round-trip lag.
 - **Hardware decoding.** CUDA (NVDEC) when available, with a fallback to
   multithreaded software decoding.
-- **Loss recovery.** NACKs, keyframe requests, long-term-reference acks,
-  and stall detection.
+- **Loss recovery.** NACKs (retried once), with frames that have holes held
+  briefly for the retransmission; keyframe requests, long-term-reference
+  acks, and stall detection.
 
 ## Requirements
 
