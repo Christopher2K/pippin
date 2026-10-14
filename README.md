@@ -137,4 +137,4 @@ cargo test
 
 `pippin` is an independent Rust implementation built on the protocol reverse-engineering work of [iShareScreen](https://github.com/renegadelink/iShareScreen). 
 
-Licensed under the **AGPL-3.0-or-later**. See [LICENSE](LICENSE) for details.
+Licensed under **AGPL-3.0**. See [LICENSE](LICENSE) for details.
