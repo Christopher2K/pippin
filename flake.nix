@@ -23,7 +23,8 @@
         {
           default = pkgs.rustPlatform.buildRustPackage {
             pname = "pippin";
-            version = "0.1.0";
+            # Version follows Cargo.toml so the flake never drifts on release bumps.
+            version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
 
             src = ./.;
 
